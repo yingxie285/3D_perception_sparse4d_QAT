@@ -1,0 +1,1923 @@
+# Copyright (c) 2024 SparseEnd2End. All rights reserved @author: Thomas Von Wu.
+
+import glob
+import os
+import os.path as osp
+import shutil
+import tempfile
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from mmcv.parallel import DataContainer, MMDistributedDataParallel
+
+from horizon_plugin_pytorch.quantization import (
+    prepare,
+    set_fake_quantize,
+    FakeQuantState,
+)
+
+from tool.utils.dist_utils import get_dist_info
+from dataset.dataloader_wrapper import (
+    dataloader_wrapper,
+    dataloader_wrapper_without_dist,
+)
+
+from dataset import *
+from modules.sparse4d_detector import *
+from dataset.dataloader_wrapper.dataloader_wrapper import build_module # 0928 dws
+
+
+class QATDDP(MMDistributedDataParallel):
+    """
+    SparseDrive QAT's special DDP is kept for prev_id only.
+
+    Sparse4D perception still has temporal detection state:
+        det_cached_feature
+        det_cached_anchor
+        det_cache_confidence
+        det_cache_instance_id
+        prev_id
+
+    Map / motion / planning state is not used.
+    """
+
+    _BROADCAST_KWARGS = {"prev_id"}
+
+    def scatter(self, inputs, kwargs, device_ids):
+        saved = {}
+        for key in self._BROADCAST_KWARGS:
+            if key in kwargs:
+                saved[key] = kwargs.pop(key)
+
+        inputs_part, kwargs_part = super().scatter(
+            inputs,
+            kwargs,
+            device_ids,
+        )
+
+        if saved:
+            for kw in kwargs_part:
+                for key, val in saved.items():
+                    kw[key] = (
+                        val.clone()
+                        if torch.is_tensor(val)
+                        else val
+                    )
+
+        return inputs_part, kwargs_part
+
+    def to_kwargs(self, inputs, kwargs, device_id):
+        saved = {}
+        for key in self._BROADCAST_KWARGS:
+            if key in kwargs:
+                saved[key] = kwargs.pop(key)
+
+        inputs_part, kwargs_part = super().to_kwargs(
+            inputs,
+            kwargs,
+            device_id,
+        )
+
+        if saved:
+            for kw in kwargs_part:
+                for key, val in saved.items():
+                    kw[key] = (
+                        val.clone()
+                        if torch.is_tensor(val)
+                        else val
+                    )
+
+        return inputs_part, kwargs_part
+
+
+def _extract_from_dc(obj):
+    """
+    SparseEnd2End itself does not require MMDetection3D DataContainer.
+
+    This function therefore handles plain Tensor / numpy / list / tuple /
+    dict directly, while also unwrapping an object exposing .data if such
+    an object is returned by a custom collate function.
+    """
+    if torch.is_tensor(obj):
+        return obj.cuda() if not obj.is_cuda else obj
+
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj).cuda()
+
+    # Optional compatibility with MMCV-like DataContainer without importing
+    # mmcv into SparseEnd2End.
+    if hasattr(obj, "data") and not isinstance(obj, (dict, list, tuple)):
+        try:
+            return _extract_from_dc(obj.data)
+        except Exception:
+            pass
+
+    if isinstance(obj, dict):
+        return {
+            k: (
+                _extract_img_metas(v)
+                if k == "img_metas"
+                else _extract_from_dc(v)
+            )
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, list):
+        return [
+            _extract_from_dc(v)
+            for v in obj
+        ]
+
+    if isinstance(obj, tuple):
+        return tuple(
+            _extract_from_dc(v)
+            for v in obj
+        )
+
+    return obj
+
+
+def _extract_img_metas(obj):
+    """
+    Keep metadata as Python/numpy objects.
+
+    Sparse4DHead uses fields such as track_id from img_metas and should not
+    receive a recursively CUDA-moved metadata dictionary.
+    """
+    if hasattr(obj, "data") and not isinstance(obj, (dict, list, tuple)):
+        try:
+            obj = obj.data
+        except Exception:
+            pass
+
+    if isinstance(obj, dict):
+        return {
+            k: _extract_meta_value(v)
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, list):
+        return [
+            _extract_img_metas(v)
+            for v in obj
+        ]
+
+    if isinstance(obj, tuple):
+        return tuple(
+            _extract_img_metas(v)
+            for v in obj
+        )
+
+    return obj
+
+
+def _extract_meta_value(obj):
+    if isinstance(obj, dict):
+        return {
+            k: _extract_meta_value(v)
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, list):
+        return [
+            _extract_meta_value(v)
+            for v in obj
+        ]
+
+    if isinstance(obj, tuple):
+        return tuple(
+            _extract_meta_value(v)
+            for v in obj
+        )
+
+    return obj
+
+
+def _meta_matrix(meta, key):
+    """
+    Read one 4x4 matrix from img_metas and move it to CUDA.
+
+    SparseEnd2End test data normally contains:
+        lidar2global
+        global2lidar
+
+    The helper also accepts the names used by the supplied SparseDrive QAT:
+        T_global
+        T_global_inv
+    """
+    value = meta[key]
+
+    if torch.is_tensor(value):
+        return value.cuda()
+
+    return torch.as_tensor(
+        value,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+
+def _extract_t_global(img_metas):
+    for meta in img_metas:
+        if "T_global" in meta:
+            key = "T_global"
+        elif "lidar2global" in meta:
+            key = "lidar2global"
+        else:
+            raise KeyError(
+                "img_metas must contain T_global or lidar2global"
+            )
+
+        break
+
+    return torch.stack(
+        [
+            _meta_matrix(meta, key)
+            for meta in img_metas
+        ],
+        dim=0,
+    )
+
+
+def _extract_t_global_inv(img_metas):
+    for meta in img_metas:
+        if "T_global_inv" in meta:
+            key = "T_global_inv"
+        elif "global2lidar" in meta:
+            key = "global2lidar"
+        else:
+            raise KeyError(
+                "img_metas must contain T_global_inv or global2lidar"
+            )
+
+        break
+
+    return torch.stack(
+        [
+            _meta_matrix(meta, key)
+            for meta in img_metas
+        ],
+        dim=0,
+    )
+
+
+def _compute_T_temp2cur(
+    cur_t_global_inv,
+    prev_t_global,
+):
+    if prev_t_global is None:
+        return None
+
+    return (
+        cur_t_global_inv
+        @ prev_t_global
+    )
+
+
+def _tile_to_batch(
+    tensor,
+    target_batch_size,
+):
+    if tensor is None:
+        return None
+
+    if not torch.is_tensor(tensor):
+        return tensor
+
+    if tensor.shape[0] == target_batch_size:
+        return tensor
+
+    if tensor.shape[0] == 1:
+        return tensor.expand(
+            target_batch_size,
+            *tensor.shape[1:],
+        ).contiguous()
+
+    return tensor
+
+
+def _projection_mat(data):
+    """
+    SparseEnd2End test.py uses lidar2img.
+    User's horizon_forward may already expose projection_mat.
+    Support both without changing the rest of the QAT workflow.
+    """
+    if "projection_mat" in data:
+        return data["projection_mat"]
+
+    if "lidar2img" in data:
+        return data["lidar2img"]
+
+    raise KeyError(
+        "Input data must contain projection_mat or lidar2img."
+    )
+
+
+def _get_det_cache(det_output, key):
+    if det_output is None:
+        return None
+
+    if not isinstance(det_output, dict):
+        raise TypeError(
+            "Sparse4D horizon_forward detection output must be a dict."
+        )
+
+    return det_output.get(key)
+
+#--------------------------------------0929-------------------------------------
+# def _run_det_forward(
+#     model,
+#     img,
+#     projection_mat,
+#     image_wh,
+#     time_interval,
+#     T_temp2cur,
+#     det_cached_feature,
+#     det_cached_anchor,
+#     det_cache_confidence,
+#     det_cache_instance_id,
+#     prev_id,
+# ):
+#     """
+#     Detection-only horizon_forward call.
+
+#     This is the detection half of the original SparseDrive QAT call.
+#     """
+#     output = model(
+#         img=img,
+#         projection_mat=projection_mat,
+#         image_wh=image_wh,
+#         time_interval=time_interval,
+#         T_temp2cur=T_temp2cur,
+#         det_cached_feature=det_cached_feature,
+#         det_cached_anchor=det_cached_anchor,
+#         det_cache_confidence=det_cache_confidence,
+#         det_cache_instance_id=det_cache_instance_id,
+#         prev_id=prev_id,
+#     )
+
+#     # Allow either:
+#     #   output = dict
+#     # or
+#     #   output = (dict,)
+#     if isinstance(output, dict):
+#         return output
+
+#     if (
+#         isinstance(output, (tuple, list))
+#         and len(output) == 1
+#         and isinstance(output[0], dict)
+#     ):
+#         return output[0]
+
+#     raise TypeError(
+#         "Expected horizon_forward to return a detection dict "
+#         "or (detection_dict,), got "
+#         f"{type(output)}"
+#     )
+def _run_det_forward(
+    model,
+    img,
+    cam_extrinsic,
+    cam_intrinsic,
+    cam_distortion,
+    image_wh,
+    time_interval,
+    # T_temp2cur,
+    cached_feature,
+    cached_anchor,
+    cache_confidence,
+    cache_track_id,
+    prev_id,
+):
+    """
+    Sparse4D Horizon deployment forward.
+
+    Keep this function strictly aligned with:
+
+        Sparse4D.horizon_forward(
+            img,
+            cam_extrinsic,
+            cam_intrinsic,
+            cam_distortion,
+            image_wh,
+            time_interval,
+            T_temp2cur,
+            cached_feature,
+            cached_anchor,
+            cache_confidence,
+            cache_track_id,
+            prev_id,
+        )
+    """
+
+    output = model(
+        img=img,
+        cam_extrinsic=cam_extrinsic,
+        cam_intrinsic=cam_intrinsic,
+        cam_distortion=cam_distortion,
+        image_wh=image_wh,
+        time_interval=time_interval,
+        # T_temp2cur=T_temp2cur,
+        cached_feature=cached_feature,
+        cached_anchor=cached_anchor,
+        cache_confidence=cache_confidence,
+        cache_track_id=cache_track_id,
+        prev_id=prev_id,
+    )
+
+    if isinstance(output, dict):
+        return output
+
+    if (
+        isinstance(output, (tuple, list))
+        and len(output) == 1
+        and isinstance(output[0], dict)
+    ):
+        return output[0]
+
+    raise TypeError(
+        "Expected Sparse4D horizon_forward to return a dict, "
+        f"but got {type(output)}"
+    )
+#-------------------------------------------------------------------------------
+
+#---------------------------------------0929------------------------------------
+# @torch.no_grad()
+# def prepare_example_input(
+#     deploy_model,
+#     dataloader,
+# ):
+#     """
+#     Same basic idea as SparseDrive:
+
+#     Run several sequential frames first, then capture the current frame's
+#     tensors together with the detection temporal state generated by the
+#     preceding frames.
+#     """
+#     det_cached_feature = None
+#     det_cached_anchor = None
+#     det_cache_confidence = None
+#     det_cache_instance_id = None
+
+#     prev_id = torch.tensor(
+#         0,
+#         dtype=torch.int32,
+#         device="cuda",
+#     )
+
+#     prev_timestamp = None
+#     prev_t_global = None
+
+#     for i, raw_data in enumerate(dataloader):
+#         data = _extract_from_dc(
+#             raw_data
+#         )
+
+#         img = data["img"]
+#         timestamp = data["timestamp"]
+#         img_metas = data["img_metas"]
+#         projection_mat = _projection_mat(data)
+#         image_wh = data["image_wh"]
+
+#         cur_t_global = _extract_t_global(
+#             img_metas
+#         )
+#         cur_t_global_inv = _extract_t_global_inv(
+#             img_metas
+#         )
+
+#         if i == 0:
+#             time_interval = None
+#         else:
+#             time_interval = (
+#                 timestamp - prev_timestamp
+#             ).to(torch.float32)
+
+#         T_temp2cur = _compute_T_temp2cur(
+#             cur_t_global_inv,
+#             prev_t_global,
+#         )
+
+#         if i == 6:
+#             return (
+#                 img,
+#                 projection_mat,
+#                 image_wh,
+#                 time_interval,
+#                 T_temp2cur,
+#                 det_cached_feature,
+#                 det_cached_anchor,
+#                 det_cache_confidence,
+#                 det_cache_instance_id,
+#                 prev_id,
+#             )
+
+#         det_output = _run_det_forward(
+#             deploy_model,
+#             img,
+#             projection_mat,
+#             image_wh,
+#             time_interval,
+#             T_temp2cur,
+#             det_cached_feature,
+#             det_cached_anchor,
+#             det_cache_confidence,
+#             det_cache_instance_id,
+#             prev_id,
+#         )
+
+#         det_cached_feature = _get_det_cache(
+#             det_output,
+#             "cached_feature",
+#         )
+#         det_cached_anchor = _get_det_cache(
+#             det_output,
+#             "cached_anchor",
+#         )
+#         det_cache_confidence = _get_det_cache(
+#             det_output,
+#             "cache_confidence",
+#         )
+#         det_cache_instance_id = _get_det_cache(
+#             det_output,
+#             "cache_instance_id",
+#         )
+
+#         new_prev_id = _get_det_cache(
+#             det_output,
+#             "new_prev_id",
+#         )
+#         if new_prev_id is not None:
+#             prev_id = new_prev_id
+
+#         prev_timestamp = timestamp
+#         prev_t_global = cur_t_global
+
+#     raise RuntimeError(
+#         "The dataloader ended before example_input could be captured."
+#     )
+@torch.no_grad()
+def prepare_example_input(
+    deploy_model,
+    dataloader,
+):
+    """
+    Build Sparse4D Horizon example_input.
+
+    Layout:
+        0  img
+        1  cam_extrinsic
+        2  cam_intrinsic
+        3  cam_distortion
+        4  image_wh
+        5  time_interval
+        6  cached_feature
+        7  cached_anchor
+        8  cache_confidence
+        9  cache_track_id
+        10 prev_id
+    """
+
+    raw_data = next(
+        iter(dataloader)
+    )
+
+    data = _extract_from_dc(
+        raw_data
+    )
+
+    required_keys = [
+        "img",
+        "cam_extrinsic",
+        "cam_intrinsic",
+        "cam_distortion",
+        "image_wh",
+    ]
+
+    missing_keys = [
+        key
+        for key in required_keys
+        if key not in data
+    ]
+
+    if missing_keys:
+        raise KeyError(
+            "Sparse4D QAT dataloader "
+            "is missing required keys: "
+            f"{missing_keys}. "
+            f"Available keys: "
+            f"{list(data.keys())}"
+        )
+
+    # ----------------------------------------------------------
+    # Image
+    #
+    # Test pipeline returns:
+    #     [Tensor(B, Ncam, C, H, W)]
+    # Horizon model needs:
+    #     Tensor(B, Ncam, C, H, W)
+    # ----------------------------------------------------------
+    img = data["img"]
+
+    if isinstance(
+        img,
+        (list, tuple),
+    ):
+        if len(img) != 1:
+            raise RuntimeError(
+                "Sparse4D QAT only supports "
+                "one test augmentation, "
+                f"but got {len(img)}."
+            )
+
+        img = img[0]
+
+    cam_extrinsic = data[
+        "cam_extrinsic"
+    ]
+
+    cam_intrinsic = data[
+        "cam_intrinsic"
+    ]
+
+    cam_distortion = data[
+        "cam_distortion"
+    ]
+
+    image_wh = data[
+        "image_wh"
+    ]
+
+    # ----------------------------------------------------------
+    # InstanceBank information
+    # ----------------------------------------------------------
+    inner = (
+        deploy_model.module
+        if hasattr(
+            deploy_model,
+            "module",
+        )
+        else deploy_model
+    )
+
+    bank = inner.head.instance_bank
+
+    batch_size = img.shape[0]
+    device = img.device
+
+#------------------------------0930----------------------------
+    # num_temp_instances = (
+    #     bank.num_temp_instances
+    # )
+
+    # num_anchor = bank.num_anchor
+
+    # embed_dims = bank.embed_dims
+
+    # anchor_dim = bank.anchor.shape[-1]
+    num_temp_instances = (
+        bank.num_temp_instances
+    )
+
+    num_anchor = bank.num_anchor
+    embed_dims = bank.embed_dims
+    anchor_dim = bank.anchor.shape[-1]
+
+    # ----------------------------------------------------------
+    # Deployment placeholder size for temporal-state I/O.
+    #
+    # In the current FP32 model:
+    #
+    #     bank.num_temp_instances == -1
+    #
+    # means temporal instances are disabled.  However, the
+    # deployment interface temporarily keeps cached_feature /
+    # cached_anchor / cache_confidence as explicit inputs.
+    #
+    # Therefore, use one dummy slot when temporal instances are
+    # disabled.  These tensors are interface placeholders only
+    # and must not participate in current-frame prediction.
+    # ----------------------------------------------------------
+    if num_temp_instances > 0:
+        deploy_num_temp_instances = num_temp_instances
+    else:
+        deploy_num_temp_instances = 1
+#-------------------------------------------------------------
+
+    # ----------------------------------------------------------
+    # Keep time_interval as deployment input.
+    # Use FP32 model's default interval.
+    # ----------------------------------------------------------
+    time_interval = torch.full(
+        (batch_size,),
+        float(
+            bank.default_time_interval
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # ----------------------------------------------------------
+    # Temporal-state placeholders.
+    #
+    # They are retained in deployment I/O but do not participate
+    # in current-frame detection.
+    # ----------------------------------------------------------
+    cached_feature = torch.zeros(
+        (
+            batch_size,
+            # num_temp_instances,
+            deploy_num_temp_instances,
+            embed_dims,
+        ),
+        dtype=bank.instance_feature.dtype,
+        device=device,
+    )
+
+    cached_anchor = torch.zeros(
+        (
+            batch_size,
+            # num_temp_instances,
+            deploy_num_temp_instances,
+            anchor_dim,
+        ),
+        dtype=bank.anchor.dtype,
+        device=device,
+    )
+
+    cache_confidence = torch.zeros(
+        (
+            batch_size,
+            # num_temp_instances,
+            deploy_num_temp_instances,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    cache_track_id = torch.full(
+        (
+            batch_size,
+            num_anchor,
+        ),
+        -1,
+        dtype=torch.int16,
+        device=device,
+    )
+
+    prev_id = torch.tensor(
+        0,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    example_input = (
+        img,                 # 0
+        cam_extrinsic,       # 1
+        cam_intrinsic,       # 2
+        cam_distortion,      # 3
+        image_wh,            # 4
+        time_interval,       # 5
+        cached_feature,      # 6
+        cached_anchor,       # 7
+        cache_confidence,    # 8
+        cache_track_id,      # 9
+        prev_id,             # 10
+    )
+
+    names = [
+        "img",
+        "cam_extrinsic",
+        "cam_intrinsic",
+        "cam_distortion",
+        "image_wh",
+        "time_interval",
+        "cached_feature",
+        "cached_anchor",
+        "cache_confidence",
+        "cache_track_id",
+        "prev_id",
+    ]
+
+    print(
+        "[prepare_example_input] "
+        "Sparse4D 11-input interface ready."
+    )
+
+    for index, (
+        name,
+        value,
+    ) in enumerate(
+        zip(
+            names,
+            example_input,
+        )
+    ):
+        print(
+            f"  [{index:02d}] "
+            f"{name}: "
+            f"shape={tuple(value.shape)}, "
+            f"dtype={value.dtype}, "
+            f"device={value.device}"
+        )
+
+    return example_input
+#-------------------------------------------------------------------------------
+
+def replace_forward_with_horizon(module):
+    if (
+        hasattr(
+            module,
+            "horizon_forward",
+        )
+        and callable(
+            module.horizon_forward
+        )
+    ):
+        module.forward = (
+            module.horizon_forward
+        )
+
+    for child in module.children():
+        replace_forward_with_horizon(
+            child
+        )
+
+
+def prepare_calib_model(
+    inner,
+    example_input,
+    qconfig_setter,
+):
+    calib_model = prepare(
+        inner,
+        example_input,
+        qconfig_setter,
+        check_result_dir="./Horizon_Model/",
+    )
+
+    calib_model.eval()
+
+    return calib_model
+
+
+def _detach_tensor(value):
+    if value is None:
+        return None
+
+    if torch.is_tensor(value):
+        return value.detach()
+
+    return value
+
+#-----------------------------------------------0929----------------------------
+# def _initial_det_state(example_input):
+#     return (
+#         _detach_tensor(example_input[5]),
+#         _detach_tensor(example_input[6]),
+#         _detach_tensor(example_input[7]),
+#         _detach_tensor(example_input[8]),
+#         _detach_tensor(example_input[9]),
+#     )
+def _initial_det_state(example_input):
+    return (
+        _detach_tensor(example_input[6]),   # cached_feature
+        _detach_tensor(example_input[7]),   # cached_anchor
+        _detach_tensor(example_input[8]),   # cache_confidence
+        _detach_tensor(example_input[9]),   # cache_track_id
+        _detach_tensor(example_input[10]),  # prev_id
+    )
+#-------------------------------------------------------------------------------
+
+def _reset_state(example_input):
+    return _initial_det_state(
+        example_input
+    )
+
+#-----------------------------------------0929----------------------------------
+# @torch.no_grad()
+# def horizon_calibration(
+#     calib_model,
+#     data_loader,
+#     example_input,
+#     num_iters=6,
+# ):
+#     calib_model.eval()
+
+#     set_fake_quantize(
+#         calib_model,
+#         FakeQuantState.CALIBRATION,
+#     )
+
+#     (
+#         det_cached_feature,
+#         det_cached_anchor,
+#         det_cache_confidence,
+#         det_cache_instance_id,
+#         prev_id,
+#     ) = _initial_det_state(
+#         example_input
+#     )
+
+#     prev_timestamp = None
+#     prev_t_global = None
+
+#     calib_iter = 0
+
+#     for raw_data in data_loader:
+#         if calib_iter >= num_iters:
+#             break
+
+#         data = _extract_from_dc(
+#             raw_data
+#         )
+
+#         img = data["img"]
+#         timestamp = data["timestamp"]
+#         img_metas = data["img_metas"]
+#         projection_mat = _projection_mat(data)
+#         image_wh = data["image_wh"]
+
+#         cur_t_global = _extract_t_global(
+#             img_metas
+#         )
+#         cur_t_global_inv = _extract_t_global_inv(
+#             img_metas
+#         )
+
+#         if prev_timestamp is None:
+#             time_interval = _tile_to_batch(
+#                 example_input[3],
+#                 img.shape[0],
+#             )
+#             T_temp2cur = _tile_to_batch(
+#                 example_input[4],
+#                 img.shape[0],
+#             )
+#         else:
+#             time_interval = (
+#                 timestamp - prev_timestamp
+#             ).to(torch.float32)
+
+#             T_temp2cur = _compute_T_temp2cur(
+#                 cur_t_global_inv,
+#                 prev_t_global,
+#             )
+
+#         det_cached_feature = _tile_to_batch(
+#             det_cached_feature,
+#             img.shape[0],
+#         )
+#         det_cached_anchor = _tile_to_batch(
+#             det_cached_anchor,
+#             img.shape[0],
+#         )
+#         det_cache_confidence = _tile_to_batch(
+#             det_cache_confidence,
+#             img.shape[0],
+#         )
+#         det_cache_instance_id = _tile_to_batch(
+#             det_cache_instance_id,
+#             img.shape[0],
+#         )
+
+#         det_output = _run_det_forward(
+#             calib_model,
+#             img,
+#             projection_mat,
+#             image_wh,
+#             time_interval,
+#             T_temp2cur,
+#             det_cached_feature,
+#             det_cached_anchor,
+#             det_cache_confidence,
+#             det_cache_instance_id,
+#             prev_id,
+#         )
+
+#         det_cached_feature = _detach_tensor(
+#             _get_det_cache(
+#                 det_output,
+#                 "cached_feature",
+#             )
+#         )
+#         det_cached_anchor = _detach_tensor(
+#             _get_det_cache(
+#                 det_output,
+#                 "cached_anchor",
+#             )
+#         )
+#         det_cache_confidence = _detach_tensor(
+#             _get_det_cache(
+#                 det_output,
+#                 "cache_confidence",
+#             )
+#         )
+#         det_cache_instance_id = _detach_tensor(
+#             _get_det_cache(
+#                 det_output,
+#                 "cache_instance_id",
+#             )
+#         )
+
+#         new_prev_id = _get_det_cache(
+#             det_output,
+#             "new_prev_id",
+#         )
+#         if new_prev_id is not None:
+#             prev_id = _detach_tensor(
+#                 new_prev_id
+#             )
+
+#         prev_timestamp = timestamp
+#         prev_t_global = cur_t_global
+
+#         calib_iter += 1
+#         print(
+#             f"calibration iter : {calib_iter}"
+#         )
+@torch.no_grad()
+def horizon_calibration(
+    calib_model,
+    data_loader,
+    example_input,
+    num_iters=6,
+):
+    calib_model.eval()
+
+    set_fake_quantize(
+        calib_model,
+        FakeQuantState.CALIBRATION,
+    )
+
+    (
+        cached_feature,
+        cached_anchor,
+        cache_confidence,
+        cache_track_id,
+        prev_id,
+    ) = _initial_det_state(
+        example_input
+    )
+
+    prev_timestamp = None
+    prev_t_global = None
+
+    calib_iter = 0
+
+    for raw_data in data_loader:
+
+        if calib_iter >= num_iters:
+            break
+
+        data = _extract_from_dc(raw_data)
+
+        required_keys = [
+            "img",
+            "timestamp",
+            "img_metas",
+            "cam_extrinsic",
+            "cam_intrinsic",
+            "cam_distortion",
+            "image_wh",
+        ]
+
+        missing_keys = [
+            key
+            for key in required_keys
+            if key not in data
+        ]
+
+        if missing_keys:
+            raise KeyError(
+                "Sparse4D calibration data missing keys: "
+                f"{missing_keys}. "
+                f"Available keys: {list(data.keys())}"
+            )
+
+        img = data["img"]
+        timestamp = data["timestamp"]
+        img_metas = data["img_metas"]
+
+        cam_extrinsic = data["cam_extrinsic"]
+        cam_intrinsic = data["cam_intrinsic"]
+        cam_distortion = data["cam_distortion"]
+        image_wh = data["image_wh"]
+
+        cur_t_global = _extract_t_global(
+            img_metas
+        )
+
+        cur_t_global_inv = _extract_t_global_inv(
+            img_metas
+        )
+
+        if prev_timestamp is None:
+
+            time_interval = _tile_to_batch(
+                example_input[5],
+                img.shape[0],
+            )
+
+            # T_temp2cur = _tile_to_batch(
+            #     example_input[6],
+            #     img.shape[0],
+            # )
+
+        else:
+
+            time_interval = (
+                timestamp - prev_timestamp
+            ).to(torch.float32)
+
+            # T_temp2cur = _compute_T_temp2cur(
+            #     cur_t_global_inv,
+            #     prev_t_global,
+            # )
+
+        cached_feature = _tile_to_batch(
+            cached_feature,
+            img.shape[0],
+        )
+
+        cached_anchor = _tile_to_batch(
+            cached_anchor,
+            img.shape[0],
+        )
+
+        cache_confidence = _tile_to_batch(
+            cache_confidence,
+            img.shape[0],
+        )
+
+        cache_track_id = _tile_to_batch(
+            cache_track_id,
+            img.shape[0],
+        )
+
+        det_output = _run_det_forward(
+            calib_model,
+            img,
+            cam_extrinsic,
+            cam_intrinsic,
+            cam_distortion,
+            image_wh,
+            time_interval,
+            # T_temp2cur,
+            cached_feature,
+            cached_anchor,
+            cache_confidence,
+            cache_track_id,
+            prev_id,
+        )
+
+        (
+            cached_feature,
+            cached_anchor,
+            cache_confidence,
+            cache_track_id,
+            prev_id,
+        ) = update_det_cache(
+            det_output,
+            prev_id,
+            distributed=False,
+        )
+
+        prev_timestamp = timestamp
+        prev_t_global = cur_t_global
+
+        calib_iter += 1
+
+        print(
+            f"calibration iter : "
+            f"{calib_iter}/{num_iters}"
+        )
+#-------------------------------------------------------------------------------
+
+#-------------------------------------0929--------------------------------------
+# def update_det_cache(
+#     det_output,
+#     prev_id,
+#     distributed=False,
+# ):
+#     det_cached_feature = _detach_tensor(
+#         _get_det_cache(
+#             det_output,
+#             "cached_feature",
+#         )
+#     )
+#     det_cached_anchor = _detach_tensor(
+#         _get_det_cache(
+#             det_output,
+#             "cached_anchor",
+#         )
+#     )
+#     det_cache_confidence = _detach_tensor(
+#         _get_det_cache(
+#             det_output,
+#             "cache_confidence",
+#         )
+#     )
+#     det_cache_instance_id = _detach_tensor(
+#         _get_det_cache(
+#             det_output,
+#             "cache_instance_id",
+#         )
+#     )
+
+#     new_prev_id = _get_det_cache(
+#         det_output,
+#         "new_prev_id",
+#     )
+
+#     if new_prev_id is not None:
+#         new_prev_id = _detach_tensor(
+#             new_prev_id
+#         )
+
+#         if (
+#             distributed
+#             and dist.is_initialized()
+#         ):
+#             dist.all_reduce(
+#                 new_prev_id,
+#                 op=dist.ReduceOp.MAX,
+#             )
+
+#         prev_id = new_prev_id
+
+#     return (
+#         det_cached_feature,
+#         det_cached_anchor,
+#         det_cache_confidence,
+#         det_cache_instance_id,
+#         prev_id,
+#     )
+def update_det_cache(
+    det_output,
+    prev_id,
+    distributed=False,
+):
+
+    cached_feature = _detach_tensor(
+        _get_det_cache(
+            det_output,
+            "cached_feature",
+        )
+    )
+
+    cached_anchor = _detach_tensor(
+        _get_det_cache(
+            det_output,
+            "cached_anchor",
+        )
+    )
+
+    cache_confidence = _detach_tensor(
+        _get_det_cache(
+            det_output,
+            "cache_confidence",
+        )
+    )
+
+    cache_track_id = _detach_tensor(
+        _get_det_cache(
+            det_output,
+            "cache_track_id",
+        )
+    )
+
+    new_prev_id = _get_det_cache(
+        det_output,
+        "prev_id",
+    )
+
+    if new_prev_id is not None:
+
+        new_prev_id = _detach_tensor(
+            new_prev_id
+        )
+
+        if (
+            distributed
+            and dist.is_initialized()
+        ):
+            dist.all_reduce(
+                new_prev_id,
+                op=dist.ReduceOp.MAX,
+            )
+
+        prev_id = new_prev_id
+
+    return (
+        cached_feature,
+        cached_anchor,
+        cache_confidence,
+        cache_track_id,
+        prev_id,
+    )
+#-------------------------------------------------------------------------------
+
+
+def compute_qat_loss(
+    calib_model,
+    det_output,
+    data,
+):
+    """
+    Sparse4D itself is the perception/detection model.
+
+    Its head receives the output dictionary containing:
+        classification
+        prediction
+        quality
+        optional denoising outputs
+
+    and computes all detection losses.
+    """
+    model = (
+        calib_model.module
+        if hasattr(
+            calib_model,
+            "module",
+        )
+        else calib_model
+    )
+
+    return model.head.loss(
+        det_output,
+        data,
+    )
+
+
+def build_test_dataloader(
+    cfg,
+    distributed=False,
+):
+    samples_per_gpu = cfg["data"]["test"].pop(
+        "samples_per_gpu",
+        1,
+    )
+
+    dataset = build_module(
+        cfg["data"]["test"]
+    )
+
+    if distributed:
+        data_loader = dataloader_wrapper(
+            dataset,
+            samples_per_gpu=samples_per_gpu,
+            workers_per_gpu=cfg["data"]["workers_per_gpu"],
+            dist=True,
+            shuffle=False,
+            nonshuffler_sampler=dict(
+                type="DistributedSampler"
+            ),
+        )
+    else:
+        data_loader = dataloader_wrapper_without_dist(
+            dataset,
+            samples_per_gpu=samples_per_gpu,
+            workers_per_gpu=cfg["data"]["workers_per_gpu"],
+            dist=False,
+            shuffle=False,
+        )
+
+    return data_loader
+
+
+def build_train_dataloader(
+    cfg,
+    distributed=False,
+):
+    train_dataset = build_module(
+        cfg["data"]["train"]
+    )
+
+    return dataloader_wrapper(
+        train_dataset,
+        cfg["data"]["samples_per_gpu"],
+        cfg["data"]["workers_per_gpu"],
+        seed=cfg.get("seed", 0),
+        runner_type=cfg["runner"]["type"],
+        dist=distributed,
+        num_gpus=len(cfg["gpu_ids"]),
+        nonshuffler_sampler=dict(
+            type="DistributedSampler"
+        ),
+    )
+
+
+def build_qat_optimizer(
+    calib_model,
+    qat_lr,
+    weight_decay=0.001,
+):
+    backbone_params = []
+    other_params = []
+
+    for name, param in calib_model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if (
+            "img_backbone" in name
+            or "img_neck" in name
+        ):
+            backbone_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = [
+        {
+            "params": backbone_params,
+            "lr": qat_lr * 0.1,
+        },
+        {
+            "params": other_params,
+            "lr": qat_lr,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        weight_decay=weight_decay,
+    )
+
+    for pg in optimizer.param_groups:
+        pg["initial_lr"] = pg["lr"]
+
+    return optimizer
+
+
+class QATLRScheduler:
+    """
+    Cosine annealing with linear warmup.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        warmup_iters,
+        total_iters,
+        min_lr_ratio=1e-3,
+    ):
+        self.optimizer = optimizer
+        self.warmup_iters = warmup_iters
+        self.total_iters = total_iters
+        self.min_lr_ratio = min_lr_ratio
+
+    def step(self, iteration):
+        if iteration < self.warmup_iters:
+            scale = (
+                iteration + 1
+            ) / self.warmup_iters
+        else:
+            progress = (
+                iteration
+                - self.warmup_iters
+            ) / max(
+                1,
+                self.total_iters
+                - self.warmup_iters,
+            )
+
+            scale = (
+                self.min_lr_ratio
+                + 0.5
+                * (
+                    1
+                    - self.min_lr_ratio
+                )
+                * (
+                    1
+                    + np.cos(
+                        np.pi
+                        * progress
+                    )
+                )
+            )
+
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = (
+                param_group["initial_lr"]
+                * scale
+            )
+
+    def get_lr(self):
+        return [
+            pg["lr"]
+            for pg in self.optimizer.param_groups
+        ]
+
+
+def save_qat_checkpoint(
+    calib_model,
+    iteration,
+    work_dir,
+):
+    model = (
+        calib_model.module
+        if hasattr(
+            calib_model,
+            "module",
+        )
+        else calib_model
+    )
+
+    ckpt_dir = osp.join(
+        work_dir,
+        "qat_checkpoints",
+    )
+
+    os.makedirs(
+        ckpt_dir,
+        exist_ok=True,
+    )
+
+    path = osp.join(
+        ckpt_dir,
+        f"qat_iter_{iteration}.ckpt",
+    )
+
+    torch.save(
+        model.state_dict(),
+        path,
+    )
+
+    print(
+        f"[save] -> {path}"
+    )
+
+    return path
+
+
+@torch.no_grad()
+def horizon_evaluate(
+    calib_model,
+    data_loader,
+    cfg,
+    example_input=None,
+):
+    calib_model.eval()
+
+    set_fake_quantize(
+        calib_model,
+        FakeQuantState.VALIDATION,
+    )
+
+    inner = (
+        calib_model.module
+        if hasattr(
+            calib_model,
+            "module",
+        )
+        else calib_model
+    )
+
+    if example_input is not None:
+        (
+            det_cached_feature,
+            det_cached_anchor,
+            det_cache_confidence,
+            det_cache_instance_id,
+            prev_id,
+        ) = _initial_det_state(
+            example_input
+        )
+    else:
+        (
+            det_cached_feature,
+            det_cached_anchor,
+            det_cache_confidence,
+            det_cache_instance_id,
+            prev_id,
+        ) = (
+            None,
+            None,
+            None,
+            None,
+            torch.tensor(
+                0,
+                dtype=torch.int32,
+                device="cuda",
+            ),
+        )
+
+    prev_timestamp = None
+    prev_t_global = None
+
+    outputs = []
+
+    for raw_data in data_loader:
+        data = _extract_from_dc(
+            raw_data
+        )
+
+        img = data["img"]
+        timestamp = data["timestamp"]
+        img_metas = data["img_metas"]
+        projection_mat = _projection_mat(data)
+        image_wh = data["image_wh"]
+
+        cur_t_global = _extract_t_global(
+            img_metas
+        )
+        cur_t_global_inv = _extract_t_global_inv(
+            img_metas
+        )
+
+        if prev_timestamp is None:
+            time_interval = (
+                example_input[3]
+                if example_input is not None
+                else None
+            )
+            # T_temp2cur = (
+            #     example_input[4]
+            #     if example_input is not None
+            #     else None
+            # )
+        else:
+            time_gap = (
+                timestamp - prev_timestamp
+            ).abs().max().item()
+
+            if time_gap > 2.0:
+                (
+                    det_cached_feature,
+                    det_cached_anchor,
+                    det_cache_confidence,
+                    det_cache_instance_id,
+                    prev_id,
+                ) = (
+                    _reset_state(
+                        example_input
+                    )
+                    if example_input is not None
+                    else (
+                        None,
+                        None,
+                        None,
+                        None,
+                        torch.tensor(
+                            0,
+                            dtype=torch.int32,
+                            device="cuda",
+                        ),
+                    )
+                )
+
+                time_interval = torch.zeros_like(
+                    timestamp,
+                    dtype=torch.float32,
+                )
+                prev_t_global = None
+                # T_temp2cur = None
+            else:
+                time_interval = (
+                    timestamp - prev_timestamp
+                ).to(torch.float32)
+
+                # T_temp2cur = _compute_T_temp2cur(
+                #     cur_t_global_inv,
+                #     prev_t_global,
+                # )
+
+        det_cached_feature = _tile_to_batch(
+            det_cached_feature,
+            img.shape[0],
+        )
+        det_cached_anchor = _tile_to_batch(
+            det_cached_anchor,
+            img.shape[0],
+        )
+        det_cache_confidence = _tile_to_batch(
+            det_cache_confidence,
+            img.shape[0],
+        )
+        det_cache_instance_id = _tile_to_batch(
+            det_cache_instance_id,
+            img.shape[0],
+        )
+
+        det_output = _run_det_forward(
+            calib_model,
+            img,
+            projection_mat,
+            image_wh,
+            time_interval,
+            # T_temp2cur,
+            det_cached_feature,
+            det_cached_anchor,
+            det_cache_confidence,
+            det_cache_instance_id,
+            prev_id,
+        )
+
+        (
+            det_cached_feature,
+            det_cached_anchor,
+            det_cache_confidence,
+            det_cache_instance_id,
+            prev_id,
+        ) = update_det_cache(
+            det_output,
+            prev_id,
+            distributed=False,
+        )
+
+        results = inner.head.post_process(
+            det_output
+        )
+
+        outputs.extend(
+            [
+                {
+                    "img_bbox": result
+                }
+                for result in results
+            ]
+        )
+
+        prev_timestamp = timestamp
+        prev_t_global = cur_t_global
+
+    rank, _ = get_dist_info()
+
+    if rank == 0:
+        kwargs = {}
+
+        eval_kwargs = cfg.get(
+            "evaluation",
+            {}
+        ).copy()
+
+        for key in ["interval"]:
+            eval_kwargs.pop(
+                key,
+                None,
+            )
+
+        eval_kwargs.update(
+            dict(
+                metric="bbox",
+                **kwargs,
+            )
+        )
+
+        if (
+            eval_kwargs.get(
+                "jsonfile_prefix",
+                None,
+            )
+            is None
+        ):
+            eval_kwargs["jsonfile_prefix"] = osp.join(
+                "./e2e_worklog",
+                osp.splitext(
+                    osp.basename(
+                        cfg.get(
+                            "filename",
+                            "sparse4d",
+                        )
+                    )
+                )[0],
+                "eval",
+            )
+
+        print(
+            "\n",
+            eval_kwargs,
+        )
+
+        results_dict = (
+            data_loader.dataset.evaluate(
+                outputs,
+                **eval_kwargs,
+            )
+        )
+
+        print(
+            results_dict
+        )
+
+        return results_dict
+
+    return outputs
+
+
+def collect_results_cpu(
+    result_part,
+    size,
+    tmpdir=None,
+):
+    rank, world_size = get_dist_info()
+
+    if tmpdir is None:
+        max_len = 512
+
+        dir_tensor = torch.full(
+            (max_len,),
+            32,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+
+        if rank == 0:
+            os.makedirs(
+                ".dist_test",
+                exist_ok=True,
+            )
+            tmpdir = tempfile.mkdtemp(
+                dir=".dist_test"
+            )
+            tmpdir_tensor = torch.tensor(
+                bytearray(
+                    tmpdir.encode()
+                ),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            dir_tensor[
+                :len(tmpdir_tensor)
+            ] = tmpdir_tensor
+
+        dist.broadcast(
+            dir_tensor,
+            0,
+        )
+
+        tmpdir = (
+            dir_tensor.cpu()
+            .numpy()
+            .tobytes()
+            .decode()
+            .rstrip()
+        )
+
+    else:
+        os.makedirs(
+            tmpdir,
+            exist_ok=True,
+        )
+
+    import pickle
+
+    with open(
+        osp.join(
+            tmpdir,
+            f"part_{rank}.pkl",
+        ),
+        "wb",
+    ) as f:
+        pickle.dump(
+            result_part,
+            f,
+        )
+
+    dist.barrier()
+
+    if rank != 0:
+        return None
+
+    ordered_results = []
+
+    for part_file in sorted(
+        glob.glob(
+            osp.join(
+                tmpdir,
+                "part_*.pkl",
+            )
+        )
+    ):
+        with open(
+            part_file,
+            "rb",
+        ) as f:
+            ordered_results.extend(
+                pickle.load(f)
+            )
+
+    ordered_results = (
+        ordered_results[:size]
+    )
+
+    shutil.rmtree(
+        tmpdir,
+        ignore_errors=True,
+    )
+
+    return ordered_results
+
+
+def is_main_process():
+    if (
+        dist.is_available()
+        and dist.is_initialized()
+    ):
+        return dist.get_rank() == 0
+
+    return True

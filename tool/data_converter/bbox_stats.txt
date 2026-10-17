@@ -1,0 +1,15 @@
+Object Class              GT              percentage(%)
+car                       264452          47.41%
+pedestrian                12281           2.20%
+truck                     5848            1.05%
+bus                       1255            0.22%
+motor                     702             0.13%
+construction_vehicle      1293            0.23%
+bicycle                   40607           7.28%
+barrier                   74145           13.29%
+stopper                   103718          18.59%
+animal                    114             0.02%
+trash_bin                 9227            1.65%
+sign                      8924            1.60%
+traffic_cone              35255           6.32%
+Total                     557821          100.00%

@@ -1,0 +1,65 @@
+一、训练
+先创建train_log目录，并将训练命令的重定向的日志train_log/0918no_quanlity_16261frame_r50_bs88.log改为您想自定义的日志名称。
+改/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/script/train.py第59行，这是训练权重的保存文件夹的名字
+查看/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/modules/head/decoder/decoder.py的得分阈值
+
+#方式一、训练 r50 没有resume，重新开始，下面是分布式训练命令
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+tmux new -s sparse4d_0925_2wframe
+source /bin/python3
+CUDA_VISIBLE_DEVICES=4,5,6,7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 -m torch.distributed.run \
+    --nproc_per_node=4 \
+    --master_port=28670 \
+    /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/script/train.py \
+    /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+    --no-validate \
+    --launcher pytorch \
+    > /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/train_log/0925use_deformable_func_16261frame_r50_bs88.log 2>&1 &
+
+#方式二、断点续训，训练 r50 带resume的命令
+cd 您放代码的路径/Detection_BEVOD_fisheye-main
+tmux new -s sparse4d_0228_r50_bs10_15188frame
+source /opt/conda/envs/sparse4d/bin/python
+CUDA_VISIBLE_DEVICES=0,1 TORCH_DISTRIBUTED_DEBUG=DETAIL \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 -m torch.distributed.run \
+    --nproc_per_node=2 \
+    --master_port=28670 \
+    您放代码的路径/Detection_BEVOD_fisheye-main/script/train.py \
+    您放代码的路径/Detection_BEVOD_fisheye-main/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+    --no-validate \
+    --launcher pytorch \
+    --resume-from \
+    您放代码的路径/Detection_BEVOD_fisheye-main/e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/latest.pth \
+    > 您放代码的路径/Detection_BEVOD_fisheye-main/train_log/0228no_quanlity_15188frame_r50_bs10.log 2>&1 &
+
+二、测试
+#测试，要把运行命令的权重路径改为您想测试的权重路径，更改tee后面的eval_data3k_0120_iter_113850.log日志名字为您自定义的名字，更改script/test.py第115行的保存文件夹的名字，更改modules/head/decoder/decoder.py第15行的得分阈值
+source /bin/python3
+CUDA_VISIBLE_DEVICES=7 \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 script/test.py \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
+--eval bbox NDS mAP\
+2>&1 | tee eval_data3k_20261015测试浮点no_DFA_iter_36800.log
+
+三、看loss曲线
+#tensorboard看loss曲线，更改tf_logs为您的tf_logs的路径
+source /bin/python3
+tensorboard --logdir /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/e2e_worklog_0923_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/tf_logs --port 6013
+
+四、可视化
+点击tool/visualization/visulaize_new.py，确认第70行的samples_per_gpu = cfg["data"]["val"].pop("samples_per_gpu", 1)是val，因为示例只划分了train和val。（如果您划分了test，可以写cfg["data"]["tset"]。）
+更改第143行save_dir = "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/visualization_0104_pred_0.3_epoch83"为您的保存路径。
+运行tool/visualization/visulaize_new.py
+（注：模型test用的得分阈值是0.5，如果要修改得分阈值，在modules/head/decoder/decoder.py第15行，修改score_threshold得分阈值）
+命令如下：
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=$(pwd):$PYTHONPATH \
+python3 tool/visualization/visulaize_new.py \
+--config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/e2e_worklog_0925_use_deformable_func_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_36800.pth

@@ -1,0 +1,42 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# ===== Logs =====
+*.log
+
+
+# ===== Checkpoints / Outputs =====
+ckpt/
+data/
+val/
+e2e_worklog_*/
+Horizon_Model/
+log/
+qconfig_setting/
+sparse4d_worklog_0918_all_camera_config_no_quality/
+train_log/
+Check_BEVOD_Label/
+visualization_*/
+# ===== IDE =====
+.idea/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Temporary files =====
+*.tmp
+*.swp
+*.swo
+
+# ===== NumPy cache / large generated files =====
+*.npy
+*.npz
+*.pth
+
+results_nusc.json

@@ -1,0 +1,156 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "bevod_to_nuscenes.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/tool/data_converter/bevod_to_nuscenes.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--data-root",
+                "./data/fisheye_data_2w_frame",
+                "--save-root",
+                "./data/nuscenes_format",
+                "--split-file",
+                "./data/fisheye_data_2w_frame/train_val_split.json",
+                "--local-root",
+                "./tool/data_converter/nuscenes_jsons",
+                "--version",
+                "v1.0-trainval",
+            ],
+        },
+        {
+            "name": "nus2dump",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/script/BEVOD_dump_nusc_ann_json_mini.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--root_path",
+                "./data/nuscenes_format",
+                "--fisheye_data_path",
+                "./data/fisheye_data_2w_frame",
+                "--info_prefix",
+                "./data/BEVOD_nusc_anno_dumpjson_mini",
+                "--version",
+                "v1.0-trainval"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:./",
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+        {
+            "name": "KMeans Anchor",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/script/nusc_anchor_generator.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--ann_file",
+                "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/data/BEVOD_nusc_anno_dumpjson_mini/train",
+                "--num_anchor",
+                "900",
+                "--detection_range",
+                "55",
+                "--output_file_name",
+                "bevod_kmeans900.npy",
+                "--verbose"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Distributed Training",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/bin/python3",
+            "program": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/script/train.py",
+            "console": "integratedTerminal",
+            "args": [
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py", // 配置文件路径
+                "--launcher",
+                "pytorch",
+                "--no-validate",
+                // "--resume-from",
+                // "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/e2e_worklog_1225/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_470860.pth",
+            ],
+            "pythonArgs": [
+                "-m",
+                "torch.distributed.run",
+                "--nproc_per_node=1",
+                "--master_port=28689",
+            ],
+            "env": {
+                //"CUDA_VISIBLE_DEVICES": "2,3,4,5,6,7",
+                "CUDA_VISIBLE_DEVICES": "5",
+                "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+            }
+        },
+        {
+            "name": "sparse4de2e_test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/script/test.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py", // 配置文件路径
+                "--checkpoint",
+                "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_151800.pth",
+                "--eval",
+                "bbox",
+                "NDS",
+                "mAP"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+            }
+        },
+        {
+            "name": "sparse4de2e_visual_new",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/tool/visualization/visulaize_new.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--config",
+                "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py", // 配置文件路径
+                "--checkpoint",
+                "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_57150.pth", //
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+                "CUDA_VISIBLE_DEVICES": "0",
+            }
+        },
+        {
+            "name": "QAT Sparse4D - calib debug",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/usr/bin/python3",
+            "program": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/script/qat_workflow_sparse4d.py",
+            "cwd": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
+                "--phase",
+                "calib",
+                "--launcher",
+                "none"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "5",
+                "HORIZON_QAT": "1",
+                "PYTHONPATH": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws:${env:PYTHONPATH}"
+            }
+        }
+    ]
+}
