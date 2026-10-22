@@ -68,10 +68,15 @@ class Sparse4D(BaseDetector):
         # 0922
         if HORIZON_QAT:
             self.horizon_init()
+            
+        self._export_raw_predictions = False
     
     # 0922
     def horizon_init(self, ):
         self.img_quant = QuantStub()
+        self.det_classification_dequant = DeQuantStub()
+        self.det_prediction_dequant = DeQuantStub()
+        self.det_quality_dequant = DeQuantStub()
 
     @auto_fp16(apply_to=("img",), out_fp32=True)
     def extract_feat(self, img, return_depth=False, metas=None):
@@ -139,14 +144,9 @@ class Sparse4D(BaseDetector):
                 data[key] = data[key][0]
         return self.simple_test(img[0], **data)
     
-    #--------------------------------------0922---------------------------------
-    def horizon_extract_feat(
-        self,
-        img,
-        return_depth=False,
-        metas=None,
-    ):
-        # img = self.img_quant(img)   #TODO 先屏蔽
+    #--------------------------------------插入节点---------------------------------
+    def horizon_extract_feat(self, img, return_depth=False, metas=None):
+        img = self.img_quant(img)   #TODO 打开
         bs = img.shape[0]
         if img.dim() == 5:  # multi-view
             num_cams = img.shape[1]
@@ -184,32 +184,76 @@ class Sparse4D(BaseDetector):
         lidar2img,
         image_wh,
         time_interval=None,
-        return_loss=None, #为了测试
-        rescale=True,
         **data,
-    ):
-        feature_maps = self.horizon_extract_feat(img)
-        batch_size = feature_maps[0].shape[0]
-        
-        metas = dict(
+    ):       
+        if self.training:
+            metas = dict(
+            cam_extrinsic=cam_extrinsic,
+            cam_intrinsic=cam_intrinsic,
+            cam_distortion=cam_distortion,
+            lidar2img=lidar2img,
+            image_wh=image_wh,
+            img_metas=data['img_metas'],
+            timestamp=data['timestamp'],
+            gt_depth=data['gt_depth'],
+            gt_depth_ori=data['gt_depth_ori'],
+            focal=data['focal'],
+            gt_bboxes_3d=data['gt_bboxes_3d'],
+            gt_labels_3d=data['gt_labels_3d']
+        )  #1020 data里面可以取到真值
+            feature_maps, depths = self.horizon_extract_feat(img, True, data)
+            batch_size = feature_maps[0].shape[0]
+            det_output = self.head.horizon_forward(
+                feature_maps,
+                metas,
+                batch_size=batch_size,
+                time_interval=time_interval,
+            )
+            #加dequant
+            for i, v in enumerate(det_output['classification']):
+                det_output['classification'][i] = self.det_classification_dequant(v)
+            for i, v in enumerate(det_output['prediction']):
+                det_output['prediction'][i] = self.det_prediction_dequant(v)
+            for i, v in enumerate(det_output['quality']):
+                det_output['quality'][i] = self.det_quality_dequant(v)
+            output = self.head.loss(det_output, data)
+            if depths is not None and "gt_depth" in data:
+                output["loss_dense_depth"] = self.depth_branch.loss(
+                    depths, data["gt_depth"]
+                )
+            return output
+        else:
+            metas = dict(
             cam_extrinsic=cam_extrinsic,
             cam_intrinsic=cam_intrinsic,
             cam_distortion=cam_distortion,
             lidar2img=lidar2img,
             image_wh=image_wh
-        )
-
-        det_output = self.head.horizon_forward(
-            feature_maps,
-            metas,
-            batch_size=batch_size,
-            time_interval=time_interval,
-        )
-        # prepare/calibration 等直接调用 Horizon forward 的地方不传 return_loss，
-        # 继续返回 head 的原始输出；single_gpu_test 会显式传 return_loss=False。
-        if return_loss is False:
+        )  #1020 测试的data里面不需要真值
+            feature_maps= self.horizon_extract_feat(img)
+            batch_size = feature_maps[0].shape[0]
+            det_output = self.head.horizon_forward(
+                feature_maps,
+                metas,
+                batch_size=batch_size,
+                time_interval=time_interval,
+            )
+            #加dequant
+            for i, v in enumerate(det_output['classification']):
+                det_output['classification'][i] = self.det_classification_dequant(v)
+            for i, v in enumerate(det_output['prediction']):
+                det_output['prediction'][i] = self.det_prediction_dequant(v)
+            for i, v in enumerate(det_output['quality']):
+                det_output['quality'][i] = self.det_quality_dequant(v)
+            if self._export_raw_predictions:  #导出的HBM不包含后处理
+                print("导出的HBM不包含后处理")
+                return (
+                    det_output["classification"][-1],
+                    det_output["prediction"][-1],
+                )
+                        
             results = self.head.post_process(det_output)
             output = [{"img_bbox": result} for result in results]
-        return output
+            return output
 #---------------------------------------------------
     

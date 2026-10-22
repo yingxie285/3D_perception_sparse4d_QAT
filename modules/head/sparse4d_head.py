@@ -127,11 +127,11 @@ class Sparse4DHead(BaseModule):
     def horizon_init(self, ):
         self.metas_projection_mat_quant = QuantStub()
         self.metas_image_wh_quant = QuantStub()
-        self.cache_confidence_quant = QuantStub()
+        # self.cache_confidence_quant = QuantStub()
         
-        self.cache_confidence_dequant = DeQuantStub()
-        self.cached_feature_dequant = DeQuantStub()
-        self.cached_anchor_dequant = DeQuantStub()
+        # self.cache_confidence_dequant = DeQuantStub()
+        # self.cached_feature_dequant = DeQuantStub()
+        # self.cached_anchor_dequant = DeQuantStub()
 #---------------------------------------------------------------------------
 
     def init_weights(self):
@@ -468,10 +468,10 @@ class Sparse4DHead(BaseModule):
         )
         
         #-------------------------------0922 插quant-TODO---------------------------------
-        # metas["cam_extrinsic"] = self.metas_projection_mat_quant(metas["cam_extrinsic"])
-        # metas["cam_intrinsic"] = self.metas_projection_mat_quant(metas["cam_intrinsic"])
-        # metas["cam_distortion"] = self.metas_projection_mat_quant(metas["cam_distortion"])
-        # metas["image_wh"] = self.metas_image_wh_quant(metas["image_wh"])
+        metas["cam_extrinsic"] = self.metas_projection_mat_quant(metas["cam_extrinsic"])
+        metas["cam_intrinsic"] = self.metas_projection_mat_quant(metas["cam_intrinsic"])
+        metas["cam_distortion"] = self.metas_projection_mat_quant(metas["cam_distortion"])
+        metas["image_wh"] = self.metas_image_wh_quant(metas["image_wh"])
 #-----------------------------------------------------------------------------
         
         # ========= prepare for denosing training ============

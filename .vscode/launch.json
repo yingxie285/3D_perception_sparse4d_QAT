@@ -151,6 +151,30 @@
                 "HORIZON_QAT": "1",
                 "PYTHONPATH": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws:${env:PYTHONPATH}"
             }
+        },
+        {
+            "name": "QAT Sparse4D - train debug",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/usr/bin/python3",
+            "program": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/script/qat_workflow_sparse4d.py",
+            "cwd": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
+                "--phase",
+                "train",
+                "--launcher",
+                "none",
+                "--no-validate"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "5",
+                "HORIZON_QAT": "1",
+                "PYTHONPATH": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws:${env:PYTHONPATH}"
+            }
         }
     ]
 }

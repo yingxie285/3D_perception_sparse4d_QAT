@@ -774,12 +774,7 @@ def single_gpu_test(model, data_loader):
 
 #xy1013
 @torch.no_grad()
-def horizon_evaluate(
-    calib_model,
-    data_loader,
-    cfg,
-    example_input=None,
-):
+def horizon_evaluate(calib_model,data_loader,cfg):
     calib_model.eval()
     dataset = data_loader.dataset
     from tool.utils.logging import ProgressBar

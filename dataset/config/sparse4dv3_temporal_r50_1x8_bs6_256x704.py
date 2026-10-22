@@ -2,8 +2,8 @@
 log_level = "INFO"
 dist_params = dict(backend="nccl")
 
-total_batch_size =20    #88
-num_gpus =1      #4
+total_batch_size =88    #88
+num_gpus =4      #4
 batch_size = total_batch_size // num_gpus  #训练用22，debug调试用1
 
 
@@ -425,7 +425,8 @@ data = dict(
 seed = 100
 # RunnerSetting
 workflow = [("train", 1)]  
-num_epochs = 200       #2万帧百度数据集是200epoch   #TODO
+# num_epochs = 200       #2万帧百度数据集是200epoch   #TODO
+num_epochs = 10   #QAT用10个epoch
 num_iters_per_epoch = int(16261 // (num_gpus * batch_size))  #训练集帧数  TODO
 
 runner = dict(

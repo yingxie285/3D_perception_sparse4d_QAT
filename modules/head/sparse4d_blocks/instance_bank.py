@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from torch import nn
 from .sparse3d_embedding import *
-# 0922 需要改！
+
 try:
     import os
     from horizon_plugin_pytorch.quantization import QuantStub
@@ -37,40 +37,21 @@ def topk(confidence, k, *inputs):
         outputs.append(input.flatten(end_dim=1)[indices].reshape(bs, k, -1))
     return confidence, outputs, indices
 
-#--------------------------xy--------------------------
+#-----------------------用到了gather-------------------------
 def horizon_topk(confidence, k, *inputs):
 
+    bs, N = confidence.shape[:2]
     confidence, indices = torch.topk(confidence, k, dim=1)
-
+    indices = indices.to(torch.int32)
     indices_i64 = indices.to(torch.int64)
-
     outputs = []
-
     for input in inputs:
-
+        # 用 gather 替代 flatten+arange(bs)+index，避免 arange(动态 bs) 产生 If 节点
         if input.dim() == 2:
-            output = torch.gather(
-                input,
-                1,
-                indices_i64,
-            )
-
+            outputs.append(torch.gather(input, 1, indices_i64))
         else:
-            gather_index = indices_i64.unsqueeze(-1).expand(
-                -1,
-                -1,
-                input.size(-1),
-            )
-
-            output = torch.gather(
-                input,
-                1,
-                gather_index,
-            )
-
-        outputs.append(output)
-
-    return confidence, outputs, indices
+            outputs.append(torch.gather(input, 1, indices_i64.unsqueeze(-1).expand(-1, -1, input.size(-1))))
+    return confidence, outputs
 #------------------------------------------------------------
 
 class InstanceBank(nn.Module):
@@ -129,10 +110,10 @@ class InstanceBank(nn.Module):
     def horizon_init(self, ):
         self.anchor_quant = QuantStub()
         self.instance_feature_quant = QuantStub()
-        self.cache_instance_feature_quant = QuantStub()
-        self.cache_anchor_quant = QuantStub()
-        self.time_interval_quant = QuantStub()
-        self.T_temp2cur_quant = QuantStub()
+        # self.cache_instance_feature_quant = QuantStub()
+        # self.cache_anchor_quant = QuantStub()
+        # self.time_interval_quant = QuantStub()
+        # self.T_temp2cur_quant = QuantStub()
 #---------------------------------------------------------------------------
 
     def init_weight(self):
@@ -231,20 +212,20 @@ class InstanceBank(nn.Module):
         cached_anchor=None
     ):
         # 插quant
-        # instance_feature_base = self.instance_feature_quant(self.instance_feature) #TODO
-        # anchor_base = self.anchor_quant(self.anchor)  #TODO
+        instance_feature_base = self.instance_feature_quant(self.instance_feature) #TODO
+        anchor_base = self.anchor_quant(self.anchor)  #TODO
         
         # 直接清空 cached anchor 和 feature  添加
         self.cached_anchor = None  #添加
         self.cached_feature = None #添加
         
-        # instance_feature = torch.tile(
-        #     instance_feature_base[None], (batch_size, 1, 1)
-        # )  #和sparsedrive保持一致
-        # anchor = torch.tile(anchor_base[None], (batch_size, 1, 1))
+        instance_feature = torch.tile(
+            instance_feature_base[None], (batch_size, 1, 1)
+        )  #和sparsedrive保持一致
+        anchor = torch.tile(anchor_base[None], (batch_size, 1, 1))
         
-        instance_feature = self.instance_feature[None].repeat((batch_size, 1, 1)) #这是和浮点的get函数一样
-        anchor = self.anchor[None].repeat((batch_size, 1, 1))  #这是和浮点的get函数一样
+        # instance_feature = self.instance_feature[None].repeat((batch_size, 1, 1)) #这是和浮点的get函数一样
+        # anchor = self.anchor[None].repeat((batch_size, 1, 1))  #这是和浮点的get函数一样
         
         return (
             instance_feature,
@@ -299,79 +280,16 @@ class InstanceBank(nn.Module):
         return instance_feature, anchor
 
 # --------------------------------------0921 horizon_update-------------------
-    def horizon_update(
-        self,
-        instance_feature,
-        anchor,
-        confidence,
-        cached_feature,
-        cached_anchor,
-        time_mask,
-        cache_confidence,
-        cache_track_id,
-    ):
-        if cached_feature is None:
-            return instance_feature, anchor, cache_track_id
+    def horizon_update(self, instance_feature, anchor, confidence):
+        """ "
+        Args:
+            instance_feature: TensorShape(bs, 1220, 256)
+            anchor: TensorShape(bs, 1220, 11)
+        Return:
 
-        num_dn = 0
-        if instance_feature.shape[1] > self.num_anchor:
-            num_dn = instance_feature.shape[1] - self.num_anchor
-            dn_instance_feature = instance_feature[:, -num_dn:]
-            dn_anchor = anchor[:, -num_dn:]
-            instance_feature = instance_feature[:, : self.num_anchor]
-            anchor = anchor[:, : self.num_anchor]
-            confidence = confidence[:, : self.num_anchor]
-
-        N = self.num_anchor - self.num_temp_instances
-        confidence = confidence.max(dim=-1).values
-        _, (selected_feature, selected_anchor), _ = horizon_topk(
-            confidence, N, instance_feature, anchor
-        )
-        selected_feature = torch.cat(
-            [cached_feature, selected_feature], dim=1
-        )
-
-        selected_anchor = torch.cat(
-            [cached_anchor, selected_anchor], dim=1,
-        )
-        # ---------------------------------------------------------
-        # replace torch.where for instance feature
-        #
-        # original:
-        # instance_feature = torch.where(
-        #     self.mask[:, None, None],
-        #     selected_feature,
-        #     instance_feature,
-        # )
-        # ---------------------------------------------------------
-        tm_feat = time_mask[:, None, None].to(instance_feature.dtype)
-        instance_feature = selected_feature * tm_feat + instance_feature * (1 - tm_feat)
-        tm_anchor = time_mask[:, None, None].to(anchor.dtype)
-        anchor = selected_anchor * tm_anchor + anchor * (1 - tm_anchor)
-        #---------------------------------------------------------
-        # track id temporal state
-        #
-        # original:
-        # self.track_id = torch.where(
-        #     self.mask[:, None],
-        #     self.track_id,
-        #     self.track_id.new_tensor(-1),
-        # )
-        #---------------------------------------------------------
-        if cache_track_id is not None:
-            track_id_dtype = cache_track_id.dtype
-            # Horizon/ORT-friendly integer arithmetic
-            track_id_int32 = cache_track_id.to(torch.int32)
-            tm_id = time_mask[:, None].to(torch.int32)
-            cache_track_id = (track_id_int32 * tm_id + torch.full_like(track_id_int32, -1) * (1 - tm_id)).to(track_id_dtype)
-
-        if num_dn > 0:
-            instance_feature = torch.cat(
-                [instance_feature, dn_instance_feature,], dim=1,
-            )
-            anchor = torch.cat([anchor, dn_anchor], dim=1,)
-
-        return instance_feature, anchor, cache_track_id
+        """
+        if self.cached_feature is None:
+            return instance_feature, anchor
 #-----------------------------------------------------------------------------
 
     def cache(
@@ -403,14 +321,13 @@ class InstanceBank(nn.Module):
             self.temp_topk_indice,
         ) = topk(confidence, self.num_temp_instances, instance_feature, anchor)
 
-#----------------------------------0921 horizon_cache-------------------------
+#--------------------------用horizon_topk-------------------------
     def horizon_cache(
         self,
         instance_feature,
         anchor,
         confidence,
         cache_confidence,
-        # cache_track_id,
     ):
         if self.num_temp_instances <= 0:
             return
@@ -424,26 +341,13 @@ class InstanceBank(nn.Module):
                 cache_confidence * self.confidence_decay,
                 confidence[:, : self.num_temp_instances],
             )
-
         self.temp_confidence = confidence
 
         (
             cache_confidence,
             (cached_feature, cached_anchor),
-            temp_topk_indice,
-        ) = horizon_topk(
-            confidence,
-            self.num_temp_instances,
-            instance_feature,
-            anchor
-        )
-
-        return (
-            cache_confidence,
-            cached_feature,
-            cached_anchor,
-            temp_topk_indice,
-        )
+        ) = horizon_topk(confidence, self.num_temp_instances, instance_feature, anchor)
+        return cache_confidence, cached_feature, cached_anchor
 #-----------------------------------------------------------------------------
 
     def get_track_id(self, confidence, threshold):
@@ -466,84 +370,37 @@ class InstanceBank(nn.Module):
         return track_id
 
 #-----------------------------0921 horizon_get_track_id-----------------------
-    def horizon_get_track_id(
-        self,
-        confidence,
-        cache_track_id,
-        temp_topk_indice,
-        threshold=None,
-        prev_id=None,
-    ):
+    def horizon_get_instance_id(self, confidence, cache_instance_id, anchor=None, threshold=None, prev_id=None):
         confidence = confidence.max(dim=-1).values.sigmoid()
         bs, num_anchor = confidence.shape
-        track_id = torch.full(
-            (bs, num_anchor),
-            -1,
-            dtype=torch.int16,
-            device=confidence.device,
-        )
+        instance_id = torch.full((bs, num_anchor), -1, dtype=torch.int16, device=confidence.device)
 
         if (
-            cache_track_id is not None
-            and cache_track_id.shape[0] == track_id.shape[0]
+            cache_instance_id is not None
+            and cache_instance_id.shape[0] == instance_id.shape[0]
         ):
-            track_id[:, : cache_track_id.shape[1]] = cache_track_id
+            instance_id[:, : cache_instance_id.shape[1]] = cache_instance_id
 
-        mask = track_id < 0
+        mask = instance_id < 0
         if threshold is not None:
             mask = mask & (confidence >= threshold)
-
-        num_new_per_batch = mask.to(torch.float16).sum(dim=1).to(torch.int32)
-
-        prev_id_int32 = prev_id.to(torch.int32)
-
-        id_pool = torch.arange(self.num_anchor, dtype=torch.int32, device=track_id.device).unsqueeze(0) + prev_id_int32
-
-        id_pool = id_pool.expand(bs, -1,)
-        # ---------------------------------------------------------
-        # Generate index of each new instance.
-        #
-        # Example:
-        # mask = [0, 1, 0, 1, 1]
-        #
-        # cumsum:
-        #        [0, 1, 1, 2, 3]
-        #
-        # idx:
-        #        [0, 0, 0, 1, 2]
-        # ---------------------------------------------------------
-        cumsum_result = torch.cumsum(mask.to(torch.float16), dim=1)
-
-        idx = torch.clamp(cumsum_result.to(torch.int32) - 1, min=0)
-
-        new_ids_full = torch.gather(
-            id_pool,
-            dim=1,
-            index=idx,
-        )
-        # ---------------------------------------------------------
-        # Replace:
-        #
-        # track_id[torch.where(mask)] = new_ids
-        #
-        # Avoid torch.where / dynamic indexing.
-        # ---------------------------------------------------------
+        # BPU: reduce_sum only supports si8/si16/f16, cumsum requires quantized input
+        # Use float16 for both sum and cumsum, avoid si64 throughout
+        num_new_per_batch = mask.to(torch.float16).sum(dim=1).to(torch.int32)  # (bs,), f16 sum → si32
+        # Fixed-size ID pool (no .item(), fully traceable)
+        id_pool = torch.arange(self.num_anchor, dtype=torch.int32, device=instance_id.device).unsqueeze(0) + prev_id.to(torch.int32)  # (1, num_anchor)
+        id_pool = id_pool.expand(bs, -1)  # (bs, num_anchor)
+        cumsum_result = torch.cumsum(mask.to(torch.float16), dim=1)  # f16 quantized cumsum on BPU
+        idx = torch.clamp(cumsum_result.to(torch.int32) - 1, min=0)  # si32 for gather
+        new_ids_full = torch.gather(id_pool, 1, idx)  # (bs, num_anchor), si32
+        # Avoid torch.where (produces Where(16) node unsupported by hb_compile's ORT).
+        # For int32, where(mask, X, Y) ≡ X*mask + Y*(1-mask), numerically equivalent.
         mask_int = mask.to(torch.int32)
+        instance_id = (new_ids_full * mask_int + instance_id.to(torch.int32) * (1 - mask_int)).to(torch.int16)
 
-        track_id = (new_ids_full * mask_int + track_id.to(torch.int32) * (1 - mask_int)).to(torch.int16)
-
-        new_prev_id = prev_id_int32 + num_new_per_batch.sum().to(torch.int32)
-
-        cache_track_id = self.horizon_update_track_id(
-            track_id,
-            temp_topk_indice,
-        )
-
-        return (
-            track_id,
-            cache_track_id,
-            new_prev_id,
-        )
+        new_prev_id = prev_id.to(torch.int32) + num_new_per_batch.sum().to(torch.int32)
+        cache_instance_id = self.horizon_update_instance_id(instance_id, confidence)
+        return instance_id, cache_instance_id, new_prev_id
 #-----------------------------------------------------------------------------
 
     def update_track_id(self, track_id=None):
@@ -555,92 +412,32 @@ class InstanceBank(nn.Module):
             value=-1,
         )  # (bs, num_querys)
     
-    # def horizon_update_track_id(self, track_id, temp_topk_indice):
-
-    #     # 获取用于时序 TopK 的置信度
-    #     if self.temp_confidence is None:
-    #         if confidence.dim() == 3:  # bs, num_anchor, num_cls
-    #             temp_conf = confidence.max(dim=-1).values
-    #         else:  # bs, num_anchor
-    #             temp_conf = confidence
-    #     else:
-    #         temp_conf = self.temp_confidence
-
-    #     # 根据置信度选出需要缓存的 track id
-    #     track_id = horizon_topk(
-    #         temp_conf,
-    #         self.num_temp_instances,
-    #         track_id,
-    #     )[1][0]
-
-    #     # 避免 squeeze(dim=-1)
-    #     # horizon_topk 对 track_id 处理后可能为 [bs, k, 1]
-    #     # 直接 reshape 成 [bs, k]
-    #     track_id = track_id.reshape(
-    #         track_id.shape[0],
-    #         -1,
-    #     )
-
-    #     # 不再使用 F.pad(int16)
-    #     # 用 torch.cat + 全 -1 Tensor 等效实现
-    #     pad_len = self.num_anchor - self.num_temp_instances
-
-    #     if pad_len > 0:
-    #         pad_tensor = torch.full(
-    #             track_id.shape[:-1] + (pad_len,),
-    #             -1,
-    #             dtype=track_id.dtype,
-    #             device=track_id.device,
-    #         )
-
-    #         cache_track_id = torch.cat(
-    #             [track_id, pad_tensor],
-    #             dim=-1,
-    #         )
-    #     else:
-    #         cache_track_id = track_id
-
-    #     return cache_track_id
-    def horizon_update_track_id(
-        self,
-        track_id=None,
-        temp_topk_indice=None,
-    ):
-        if temp_topk_indice is None:
-            return track_id
-        bs = track_id.shape[0]
-
-        track_id = track_id.flatten(
-            end_dim=1
-        )[temp_topk_indice].reshape(
-            bs,
-            -1,
-        )
-
-        pad_len = (
-            self.num_anchor
-            - self.num_temp_instances
-        )
-
-        if pad_len > 0:
-
-            pad_tensor = torch.full(
-                track_id.shape[:-1] + (pad_len,),
-                -1,
-                dtype=track_id.dtype,
-                device=track_id.device,
-            )
-
-
-            cache_track_id = torch.cat(
-                [
-                    track_id,
-                    pad_tensor,
-                ],
-                dim=-1,
-            )
+    def horizon_update_instance_id(self, instance_id=None, confidence=None):
+        if self.temp_confidence is None:
+            if confidence.dim() == 3:  # bs, num_anchor, num_cls
+                temp_conf = confidence.max(dim=-1).values
+            else:  # bs, num_anchor
+                temp_conf = confidence
         else:
-
-            cache_track_id = track_id
-
-        return cache_track_id
+            temp_conf = self.temp_confidence
+        instance_id = horizon_topk(temp_conf, self.num_temp_instances, instance_id)[1][
+            0
+        ]
+        # 避免 squeeze(dim=-1)：动态 shape 下 trace 会生成 If 节点，hmct shape inference 不支持。
+        # horizon_topk 对 2D input 返回 [bs, k]，k=num_temp_instances>1，无需 squeeze。
+        # 用 reshape 明确目标 shape，避免 If。
+        instance_id = instance_id.reshape(instance_id.shape[0], -1)
+        # ONNX F.pad(int16) 产生 Pad(13) 节点，onnxruntime CPU EP 未注册 INT16 kernel，
+        # 用 cat + 预构造 -1 填充张量替代，语义等价。
+        pad_len = self.num_anchor - self.num_temp_instances
+        if pad_len > 0:
+            pad_tensor = torch.full(
+                instance_id.shape[:-1] + (pad_len,),
+                -1,
+                dtype=instance_id.dtype,
+                device=instance_id.device,
+            )
+            cache_instance_id = torch.cat([instance_id, pad_tensor], dim=-1)
+        else:
+            cache_instance_id = instance_id
+        return cache_instance_id

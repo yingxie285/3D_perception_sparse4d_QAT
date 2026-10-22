@@ -338,16 +338,16 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
             temp_key_points_list.append(temp_key_points) #每个历史帧的关键点形状为 [bs, num_anchor, 13, 3]，表示补偿运动后的全局3D坐标
         return key_points, temp_key_points_list
 
-#-----------------------------------0922--------------------------------------
+#-----------------------------------加quant--------------------------------------
     def horizon_forward(
         self,
         anchor,
         instance_feature=None,
     ):
-        # fix_scale = self.scale_quant(self.fix_scale)   #TODO
+        fix_scale = self.scale_quant(self.fix_scale)   #TODO
         bs, num_anchor = anchor.shape[:2]
         size = anchor[..., None, [W,L,H]].exp()  #下面的保持和浮点一致
-        key_points = self.fix_scale * size  # (bs, num_query, 7, 3)
+        key_points = fix_scale * size  # (bs, num_query, 7, 3)
         # self.num_learnable_pts default=0 在DFA模块设置为6
         if self.num_learnable_pts > 0 and instance_feature is not None:
             learnable_scale = (
@@ -428,7 +428,7 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
             dst_anchors.append(dst_anchor)
         return dst_anchors
 
-#---------------------------------------0922----------------------------------
+#---------------------------------------和浮点一样---------------------------------
     @staticmethod
     def horizon_anchor_projection(
         anchor,

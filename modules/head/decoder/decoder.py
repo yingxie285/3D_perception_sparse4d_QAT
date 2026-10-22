@@ -22,16 +22,15 @@ class SparseBox3DDecoder(object):
     # 将网络输出的原始参数转换为物理量
     def decode_box(self, box):
         yaw = torch.atan2(box[:, SIN_YAW], box[:, COS_YAW])
-        box = torch.cat(
-            [
-                box[:, [X, Y, Z]],
-                box[:, [W, L, H]].exp(),
-                yaw[:, None],
-                box[:, VX:],
-            ],
-            dim=-1,
-        )
-        return box
+        decoded = [
+            box[:, [X, Y, Z]],
+            box[:, [W, L, H]].exp(),
+            yaw[:, None],
+        ]
+        # Avoid emitting an unsupported empty slice for velocity-free 8D boxes.
+        if box.shape[-1] > VX:
+            decoded.append(box[:, VX:])
+        return torch.cat(decoded, dim=-1)
 
     def decode(
         self,
