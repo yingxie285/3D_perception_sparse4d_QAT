@@ -8,8 +8,9 @@ build/
 
 # ===== Logs =====
 *.log
-
-
+# 保留指定的日志文件
+!/eval_data3k_20261015测试浮点no_DFA_iter_36800.log
+!/eval_data3k_20261023测试calib1023withprepare_iter.log
 # ===== Checkpoints / Outputs =====
 ckpt/
 data/

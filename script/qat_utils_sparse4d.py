@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 import torch
 import torch.distributed as dist
-from mmcv.parallel import DataContainer, MMDistributedDataParallel
+from dataset.utils.data_container import DataContainer
 
 from horizon_plugin_pytorch.quantization import (
     prepare,
@@ -29,290 +29,84 @@ from dataset.dataloader_wrapper.dataloader_wrapper import build_module # 0928 dw
 from tool.utils.data_parallel import E2EDataParallel
 from tool.utils.logging import ProgressBar
 
-class QATDDP(MMDistributedDataParallel):
-    """
-    SparseDrive QAT's special DDP is kept for prev_id only.
+# class QATDDP(MMDistributedDataParallel):
+#     """
+#     SparseDrive QAT's special DDP is kept for prev_id only.
 
-    Sparse4D perception still has temporal detection state:
-        det_cached_feature
-        det_cached_anchor
-        det_cache_confidence
-        det_cache_instance_id
-        prev_id
+#     Sparse4D perception still has temporal detection state:
+#         det_cached_feature
+#         det_cached_anchor
+#         det_cache_confidence
+#         det_cache_instance_id
+#         prev_id
 
-    Map / motion / planning state is not used.
-    """
+#     Map / motion / planning state is not used.
+#     """
 
-    _BROADCAST_KWARGS = {"prev_id"}
+#     _BROADCAST_KWARGS = {"prev_id"}
 
-    def scatter(self, inputs, kwargs, device_ids):
-        saved = {}
-        for key in self._BROADCAST_KWARGS:
-            if key in kwargs:
-                saved[key] = kwargs.pop(key)
+#     def scatter(self, inputs, kwargs, device_ids):
+#         saved = {}
+#         for key in self._BROADCAST_KWARGS:
+#             if key in kwargs:
+#                 saved[key] = kwargs.pop(key)
 
-        inputs_part, kwargs_part = super().scatter(
-            inputs,
-            kwargs,
-            device_ids,
-        )
+#         inputs_part, kwargs_part = super().scatter(
+#             inputs,
+#             kwargs,
+#             device_ids,
+#         )
 
-        if saved:
-            for kw in kwargs_part:
-                for key, val in saved.items():
-                    kw[key] = (
-                        val.clone()
-                        if torch.is_tensor(val)
-                        else val
-                    )
+#         if saved:
+#             for kw in kwargs_part:
+#                 for key, val in saved.items():
+#                     kw[key] = (
+#                         val.clone()
+#                         if torch.is_tensor(val)
+#                         else val
+#                     )
 
-        return inputs_part, kwargs_part
+#         return inputs_part, kwargs_part
 
-    def to_kwargs(self, inputs, kwargs, device_id):
-        saved = {}
-        for key in self._BROADCAST_KWARGS:
-            if key in kwargs:
-                saved[key] = kwargs.pop(key)
+#     def to_kwargs(self, inputs, kwargs, device_id):
+#         saved = {}
+#         for key in self._BROADCAST_KWARGS:
+#             if key in kwargs:
+#                 saved[key] = kwargs.pop(key)
 
-        inputs_part, kwargs_part = super().to_kwargs(
-            inputs,
-            kwargs,
-            device_id,
-        )
+#         inputs_part, kwargs_part = super().to_kwargs(
+#             inputs,
+#             kwargs,
+#             device_id,
+#         )
 
-        if saved:
-            for kw in kwargs_part:
-                for key, val in saved.items():
-                    kw[key] = (
-                        val.clone()
-                        if torch.is_tensor(val)
-                        else val
-                    )
+#         if saved:
+#             for kw in kwargs_part:
+#                 for key, val in saved.items():
+#                     kw[key] = (
+#                         val.clone()
+#                         if torch.is_tensor(val)
+#                         else val
+#                     )
 
-        return inputs_part, kwargs_part
+#         return inputs_part, kwargs_part
 
 
-def _extract_from_dc(obj):
-    """
-    SparseEnd2End itself does not require MMDetection3D DataContainer.
-
-    This function therefore handles plain Tensor / numpy / list / tuple /
-    dict directly, while also unwrapping an object exposing .data if such
-    an object is returned by a custom collate function.
-    """
+def _extract_from_dc(obj, _depth=0):
     if torch.is_tensor(obj):
         return obj.cuda() if not obj.is_cuda else obj
-
     if isinstance(obj, np.ndarray):
-        return torch.from_numpy(obj).cuda()
-
-    # Optional compatibility with MMCV-like DataContainer without importing
-    # mmcv into SparseEnd2End.
-    if hasattr(obj, "data") and not isinstance(obj, (dict, list, tuple)):
-        try:
-            return _extract_from_dc(obj.data)
-        except Exception:
-            pass
-
+        return torch.from_numpy(obj).float().cuda()
+    if isinstance(obj, DataContainer):
+        data = obj.data
+        if isinstance(data, list) and len(data) > 0:
+            return _extract_from_dc(data[0], _depth=_depth+1)
+        return _extract_from_dc(data, _depth=_depth+1)
     if isinstance(obj, dict):
-        return {
-            k: (
-                _extract_img_metas(v)
-                if k == "img_metas"
-                else _extract_from_dc(v)
-            )
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        return [
-            _extract_from_dc(v)
-            for v in obj
-        ]
-
-    if isinstance(obj, tuple):
-        return tuple(
-            _extract_from_dc(v)
-            for v in obj
-        )
-
+        return {k: _extract_from_dc(v, _depth=_depth+1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_extract_from_dc(v, _depth=_depth+1) for v in obj)
     return obj
-
-
-def _extract_img_metas(obj):
-    """
-    Keep metadata as Python/numpy objects.
-
-    Sparse4DHead uses fields such as track_id from img_metas and should not
-    receive a recursively CUDA-moved metadata dictionary.
-    """
-    if hasattr(obj, "data") and not isinstance(obj, (dict, list, tuple)):
-        try:
-            obj = obj.data
-        except Exception:
-            pass
-
-    if isinstance(obj, dict):
-        return {
-            k: _extract_meta_value(v)
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        return [
-            _extract_img_metas(v)
-            for v in obj
-        ]
-
-    if isinstance(obj, tuple):
-        return tuple(
-            _extract_img_metas(v)
-            for v in obj
-        )
-
-    return obj
-
-
-def _extract_meta_value(obj):
-    if isinstance(obj, dict):
-        return {
-            k: _extract_meta_value(v)
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        return [
-            _extract_meta_value(v)
-            for v in obj
-        ]
-
-    if isinstance(obj, tuple):
-        return tuple(
-            _extract_meta_value(v)
-            for v in obj
-        )
-
-    return obj
-
-
-def _meta_matrix(meta, key):
-    """
-    Read one 4x4 matrix from img_metas and move it to CUDA.
-
-    SparseEnd2End test data normally contains:
-        lidar2global
-        global2lidar
-
-    The helper also accepts the names used by the supplied SparseDrive QAT:
-        T_global
-        T_global_inv
-    """
-    value = meta[key]
-
-    if torch.is_tensor(value):
-        return value.cuda()
-
-    return torch.as_tensor(
-        value,
-        dtype=torch.float32,
-        device="cuda",
-    )
-
-
-def _extract_t_global(img_metas):
-    for meta in img_metas:
-        if "T_global" in meta:
-            key = "T_global"
-        elif "lidar2global" in meta:
-            key = "lidar2global"
-        else:
-            raise KeyError(
-                "img_metas must contain T_global or lidar2global"
-            )
-
-        break
-
-    return torch.stack(
-        [
-            _meta_matrix(meta, key)
-            for meta in img_metas
-        ],
-        dim=0,
-    )
-
-
-def _extract_t_global_inv(img_metas):
-    for meta in img_metas:
-        if "T_global_inv" in meta:
-            key = "T_global_inv"
-        elif "global2lidar" in meta:
-            key = "global2lidar"
-        else:
-            raise KeyError(
-                "img_metas must contain T_global_inv or global2lidar"
-            )
-
-        break
-
-    return torch.stack(
-        [
-            _meta_matrix(meta, key)
-            for meta in img_metas
-        ],
-        dim=0,
-    )
-
-
-def _compute_T_temp2cur(
-    cur_t_global_inv,
-    prev_t_global,
-):
-    if prev_t_global is None:
-        return None
-
-    return (
-        cur_t_global_inv
-        @ prev_t_global
-    )
-
-
-def _tile_to_batch(
-    tensor,
-    target_batch_size,
-):
-    if tensor is None:
-        return None
-
-    if not torch.is_tensor(tensor):
-        return tensor
-
-    if tensor.shape[0] == target_batch_size:
-        return tensor
-
-    if tensor.shape[0] == 1:
-        return tensor.expand(
-            target_batch_size,
-            *tensor.shape[1:],
-        ).contiguous()
-
-    return tensor
-
-
-def _projection_mat(data):
-    """
-    SparseEnd2End test.py uses lidar2img.
-    User's horizon_forward may already expose projection_mat.
-    Support both without changing the rest of the QAT workflow.
-    """
-    if "projection_mat" in data:
-        return data["projection_mat"]
-
-    if "lidar2img" in data:
-        return data["lidar2img"]
-
-    raise KeyError(
-        "Input data must contain projection_mat or lidar2img."
-    )
 
 
 def _get_det_cache(det_output, key):
@@ -326,60 +120,24 @@ def _get_det_cache(det_output, key):
 
     return det_output.get(key)
 
-#------------------xy1013-------------
+#------------------构造示例输入-------------
 @torch.no_grad()
-def prepare_example_input(deploy_model, dataloader):
-    deploy_model.eval()
-
+def prepare_example_input(dataloader):
     prev_timestamp = None
-    example_input = None
 
     for i, data in enumerate(dataloader):
         data = _extract_from_dc(data)
 
-        img = data["img"]
-        if isinstance(img, list):
-            assert len(img) == 1, f"Unexpected img list length: {len(img)}"
-            img = img[0]
-        img = img.cuda().float()
+        img = data["img"].cuda()
+        timestamp = data["timestamp"].cuda()
+        cam_extrinsic = data["cam_extrinsic"].cuda()
+        cam_intrinsic = data["cam_intrinsic"].cuda()
+        cam_distortion = data["cam_distortion"].cuda()
+        lidar2img = data["lidar2img"].cuda()
+        image_wh = data["image_wh"].cuda()
 
-        cam_extrinsic = data["cam_extrinsic"]
-        if isinstance(cam_extrinsic, list):
-            assert len(cam_extrinsic) == 1, f"Unexpected cam_extrinsic list length: {len(cam_extrinsic)}"
-            cam_extrinsic = cam_extrinsic[0]
-        cam_extrinsic = cam_extrinsic.cuda().float()
-
-        cam_intrinsic = data["cam_intrinsic"]
-        if isinstance(cam_intrinsic, list):
-            assert len(cam_intrinsic) == 1, f"Unexpected cam_intrinsic list length: {len(cam_intrinsic)}"
-            cam_intrinsic = cam_intrinsic[0]
-        cam_intrinsic = cam_intrinsic.cuda().float()
-
-        cam_distortion = data["cam_distortion"]
-        if isinstance(cam_distortion, list):
-            assert len(cam_distortion) == 1, f"Unexpected cam_distortion list length: {len(cam_distortion)}"
-            cam_distortion = cam_distortion[0]
-        cam_distortion = cam_distortion.cuda().float()
-
-        image_wh = data["image_wh"]
-        if isinstance(image_wh, list):
-            assert len(image_wh) == 1, f"Unexpected image_wh list length: {len(image_wh)}"
-            image_wh = image_wh[0]
-        image_wh = image_wh.cuda().float()
-
-        timestamp = data["timestamp"]
-        if isinstance(timestamp, list):
-            assert len(timestamp) == 1, f"Unexpected timestamp list length: {len(timestamp)}"
-            timestamp = timestamp[0]
-        timestamp = timestamp.cuda().float()
-        
-        lidar2img = data["lidar2img"]
-        lidar2img = lidar2img.cuda().float()
-
-        if i == 0 or prev_timestamp is None:
-            time_interval = torch.zeros_like(timestamp, dtype=torch.float32)
-        else:
-            time_interval = (timestamp - prev_timestamp).to(torch.float32)
+        if i == 0:
+            time_interval = torch.tensor(1.0, dtype=torch.float32, device="cuda") #不做时序，分母是1，不影响
 
         example_input = (
             img,
@@ -389,16 +147,10 @@ def prepare_example_input(deploy_model, dataloader):
             lidar2img,
             image_wh,
             time_interval
-        )    #理论上这里得到dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py中test的pipeline需要的keys字段，但是模型实际只用这7个变量，没问题
+        )    #和modules/sparse4d_detector.py的horizon_forward保持一致
 
         if i >= 1:
             break
-
-        prev_timestamp = timestamp
-
-    if example_input is None:
-        raise RuntimeError("prepare_example_input failed: dataloader is empty.")
-
     names = (
         "img",
         "cam_extrinsic",

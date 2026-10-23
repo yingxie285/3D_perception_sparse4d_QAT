@@ -211,7 +211,7 @@ class SparseBox3DRefinementModule(BaseModule):
             output[..., SIN_YAW:VX] = torch.nn.functional.normalize(
                 output[..., SIN_YAW:VX], dim=-1
             )
-        if self.output_dim > 8:  # default=11
+        if self.output_dim > 8:  # default=8
             if not isinstance(time_interval, torch.Tensor):
                 time_interval = instance_feature.new_tensor(time_interval)
             translation = torch.transpose(output[..., VX:], 0, -1)

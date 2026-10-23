@@ -139,7 +139,9 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
+                "--config",
                 "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py",
+                "--base-checkpoint",
                 "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
                 "--phase",
                 "calib",
@@ -147,7 +149,7 @@
                 "none"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "5",
+                "CUDA_VISIBLE_DEVICES": "7",
                 "HORIZON_QAT": "1",
                 "PYTHONPATH": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws:${env:PYTHONPATH}"
             }
@@ -162,16 +164,18 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
+                "--config",
                 "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py",
-                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
                 "--phase",
                 "train",
+                "--base-checkpoint",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
                 "--launcher",
                 "none",
                 "--no-validate"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "5",
+                "CUDA_VISIBLE_DEVICES": "7",
                 "HORIZON_QAT": "1",
                 "PYTHONPATH": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws:${env:PYTHONPATH}"
             }

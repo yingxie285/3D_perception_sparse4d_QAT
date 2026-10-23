@@ -29,6 +29,7 @@ from horizon_plugin_pytorch.quantization.fake_quantize import FakeQuantize
 import horizon_plugin_pytorch.quantization.observer_v2 as observer_v2
 from horizon_plugin_pytorch.dtype import qint8, qint16
 from horizon_plugin_pytorch.quantization import get_qconfig
+from horizon_plugin_profiler import QuantAnalysis
 from horizon_plugin_pytorch.quantization.hbdk4 import export
 from hbdk4.compiler import compile, convert, hbm_perf, save
 
@@ -50,27 +51,19 @@ from tool.utils.logging import ProgressBar
 from pathlib import Path
 
 from qat_utils_sparse4d import (
-    QATDDP,
-    _extract_from_dc,
     prepare_example_input,
     replace_forward_with_horizon,
-    horizon_evaluate,
-    build_qat_optimizer,
-    QATLRScheduler,
-    save_qat_checkpoint,
-    compute_qat_loss,
     build_test_dataloader,
-    build_train_dataloader,
-    _tile_to_batch,
 )
 
 
 # Keep the original SparseDrive QAT path-variable style.
 # 允许实验通过环境变量指定独立输出目录，避免覆盖已有 calib.ckpt。
-PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1021_int16/calib")
+PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1023withprepare余弦相似度")
 WORK_DIR = "./Sparse4D_QAT/"
 CALIBRATION_CKPT = WORK_DIR + PREFIEX + ".ckpt"
 EXAMPLE_INPUT_PT = WORK_DIR + PREFIEX + "/_example_input.pt"
+DEBUG_PATH = WORK_DIR + PREFIEX + "/float_vs_calib3"
 QAT_BC = WORK_DIR + PREFIEX + "/qat.bc"
 QAT_ONNX = WORK_DIR + PREFIEX + "/qat.onnx"
 QUANTIZE_BC = WORK_DIR + PREFIEX + "/quantize.bc"
@@ -121,7 +114,7 @@ def get_qconfig_setter(model=None):
             ModuleNameTemplate({"": torch.float16}),
             ConvDtypeTemplate(input_dtype=qint16, weight_dtype=qint8),
             MatmulDtypeTemplate(input_dtypes=qint16),
-    #--------------------------------------1008--TODO----------------------------------
+    #------------1008--TODO--把head.layers.0.matmul_test这个算子加上---------------------------
             ModuleNameTemplate(
                 {
 
@@ -348,17 +341,17 @@ def horizon_export(calib_model, example_input, args):
 
 
 @torch.no_grad()
-def prepare_calib_model(inner, check_result_dir=None):
+def prepare_calib_model(inner,example_input,  check_result_dir=None):
     print("准备calib-model ")
 
     qconfig_setter = get_qconfig_setter(inner)
-    calib_model = prepare(inner, qconfig_setter,
-                          check_result_dir=check_result_dir or WORK_DIR+PREFIEX+"/")
+    calib_model = prepare(inner, example_input, qconfig_setter,
+                          check_result_dir=check_result_dir or WORK_DIR+PREFIEX+"/") #可在产物路径中找到 model_check_result.txt 和 fx_graph.txt 用于分析。
     calib_model.eval()
     return calib_model
 
 def single_gpu_test(model, data_loader):
-    model.eval()
+    # model.eval()   #不要再次调用 model.eval()，否则可能导致校准统计量无法正常更新。
     results = []
     dataset = data_loader.dataset
     PALETTE = getattr(dataset, "PALETTE", None)
@@ -375,17 +368,128 @@ def single_gpu_test(model, data_loader):
             prog_bar.update()
     return results
 
+#调试函数
+def snapshot_quant_stats(model):
+    """
+    保存模型 state_dict 中与量化尺度、Observer 统计量相关的状态。
+    返回 CPU 副本，避免后续前向传播修改原始数据。
+    """
+    keywords = (
+        "scale",
+        "min_val",
+        "max_val",
+        "zero_point",
+        "observer",
+    )
+
+    stats = {}
+
+    for name, value in model.state_dict().items():
+        if any(key in name.lower() for key in keywords):
+            if torch.is_tensor(value):
+                stats[name] = value.detach().cpu().clone()
+
+    return stats
+
+
+def compare_quant_stats(before, after, max_print=100):
+    """比较校准前后的量化统计量。"""
+    print("\n========== 量化统计量变化 ==========")
+
+    before_keys = set(before)
+    after_keys = set(after)
+
+    print(f"校准前记录数：{len(before_keys)}")
+    print(f"校准后记录数：{len(after_keys)}")
+    print(f"新增记录数：{len(after_keys - before_keys)}")
+    print(f"消失记录数：{len(before_keys - after_keys)}")
+
+    common_keys = sorted(before_keys & after_keys)
+    changed_count = 0
+    unchanged_count = 0
+
+    for name in common_keys:
+        old = before[name]
+        new = after[name]
+
+        if old.shape != new.shape:
+            print(f"[形状变化] {name}: {old.shape} -> {new.shape}")
+            continue
+
+        # 对浮点张量比较数值；对整数或布尔张量比较是否完全一致
+        if old.is_floating_point() or old.is_complex():
+            same = torch.allclose(old, new, rtol=1e-6, atol=1e-8, equal_nan=True)
+            if old.numel() > 0:
+                delta = (new - old).abs()
+                max_diff = delta.max().item()
+                old_min, old_max = old.min().item(), old.max().item()
+                new_min, new_max = new.min().item(), new.max().item()
+            else:
+                max_diff = 0.0
+                old_min = old_max = new_min = new_max = float("nan")
+        else:
+            same = torch.equal(old, new)
+            max_diff = 0.0 if same else float("nan")
+            old_min = old_max = new_min = new_max = "非浮点"
+
+        if same:
+            unchanged_count += 1
+        else:
+            changed_count += 1
+            if changed_count <= max_print:
+                print(
+                    f"[已变化] {name}\n"
+                    f"    before min/max: {old_min} / {old_max}\n"
+                    f"    after  min/max: {new_min} / {new_max}\n"
+                    f"    max_abs_diff: {max_diff}"
+                )
+
+    print(f"\n发生变化：{changed_count}")
+    print(f"未发生变化：{unchanged_count}")
+
+    if changed_count > max_print:
+        print(f"其余 {changed_count - max_print} 项变化已省略。")
+
+    if not common_keys:
+        print(
+            "警告：没有找到前后都存在的相关状态。"
+            "请检查该版本插件是否将 Observer 状态保存在 state_dict 中。"
+        )
+
+    print("====================================\n")
+
 
 
 @torch.no_grad()
 def horizon_calibration(calib_model, data_loader,cfg):
-    calib_model.eval()
+    calib_model.eval() # 1. 先设置评估模式
 
-    set_fake_quantize(calib_model, FakeQuantState.CALIBRATION)
+    set_fake_quantize(calib_model, FakeQuantState.CALIBRATION)  # 2. 再切换到校准模式
     dataset = data_loader.dataset
     #与test.py一致的测试
-    model = E2EDataParallel(calib_model, device_ids=[0])
-    outputs = single_gpu_test(model, data_loader)
+    model = E2EDataParallel(calib_model, device_ids=[0])  
+    print("calib_model:", type(calib_model))
+    print("model.module:", type(model.module))
+
+    # ① 校准前：查看量化开关
+    for name, module in calib_model.named_modules():
+        if hasattr(module, "fake_quant_enabled"):
+            print(name, module.fake_quant_enabled)
+    # ② 保存校准前的量化统计量
+    stats_before = snapshot_quant_stats(calib_model)
+    print(f"\n校准前记录到 {len(stats_before)} 项量化相关状态")
+
+    # ③ 执行校准数据集前向推理
+    # 注意：single_gpu_test 内部不要再次调用 model.eval()
+    outputs = single_gpu_test(model, data_loader)   # 3. 直接执行前向校准，不再调用 eval()
+    
+    # ④ 保存校准后的量化统计量
+    stats_after = snapshot_quant_stats(calib_model)
+    print(f"校准后记录到 {len(stats_after)} 项量化相关状态")
+
+    # ⑤ 对比校准前后
+    compare_quant_stats(stats_before, stats_after)
+    
     
     rank, _ = get_dist_info()
     if rank == 0:
@@ -395,7 +499,7 @@ def horizon_calibration(calib_model, data_loader,cfg):
 
         if eval_kwargs.get("jsonfile_prefix") is None:
             eval_kwargs["jsonfile_prefix"] = osp.join(
-                "./e2e_worklog_test20261019calib阶段带节点xyuse_iter36800_deformable_score0.5_3739frame_bevod_val",
+                "./e2e_worklog_test20261023calib阶段关闭了内部的model.eval()_use_iter36800_deformable_score0.5_3739frame_bevod_val",
                 osp.splitext(osp.basename(cfg.get("filename", "sparse4d")))[0],
                 "eval",
             )
@@ -431,7 +535,19 @@ def horizon_QAT_test(qat_model, data_loader,cfg):
         results_dict = dataset.evaluate(outputs, **eval_kwargs)
         print(results_dict)
 
-#-----------------------------------------------1008----------------------------------------
+def quant_analysis(float_model, calib_model, example_input):
+    set_fake_quantize(calib_model, FakeQuantState.VALIDATION)
+    qa = QuantAnalysis(
+        baseline_model=float_model,
+        analysis_model=calib_model,
+        analysis_model_type="fake_quant",
+        device_ids=0,
+        out_dir=DEBUG_PATH,
+    )
+    qa.set_bad_case(example_input)
+
+
+#--------------------calib阶段--------------
 @torch.no_grad()
 def run_calib_phase(args, cfg):
     print("=" * 60)
@@ -440,22 +556,22 @@ def run_calib_phase(args, cfg):
 
     data_loader = build_test_dataloader(cfg, distributed=False,)
 
-    calib_model = _build_deploy_model(cfg,args.base_checkpoint)
+    deploy_model = _build_deploy_model(cfg,args.base_checkpoint) #用浮点的权重构建模型
 
-    # example_input = prepare_example_input(deploy_model, data_loader)  #不做时序的话用不上example_input
-    # torch.save(example_input, EXAMPLE_INPUT_PT)
+    example_input = prepare_example_input(data_loader)  #不做时序的话直接构造1帧示例输入
+    torch.save(example_input, EXAMPLE_INPUT_PT)
 
-    # calib_model = prepare_calib_model(deploy_model)
+    calib_model = prepare_calib_model(deploy_model, example_input) #传入示例输入，prepare_calib_model里面会进行prepare
 
     calib_model.eval()
 
     horizon_calibration(calib_model, data_loader,cfg)   #这里不传时序相关的example_input，和test.py一样的逻辑
 
     print("[Calibration] checkpoint ->",CALIBRATION_CKPT)
-
-    # horizon_evaluate(deploy_model, data_loader, cfg) #xy1012 calib阶段做eval测试
-    torch.save(calib_model.state_dict(), CALIBRATION_CKPT)
-    # Keep SparseDrive structure: calibration result can be exported directly.
+    
+    calib_model.load_state_dict(torch.load(CALIBRATION_CKPT))
+    quant_analysis(deploy_model, calib_model, example_input) #算子余弦相似度
+    
     # horizon_export(calib_model, example_input) #TODO
 
     print("[Phase 1] Done.")

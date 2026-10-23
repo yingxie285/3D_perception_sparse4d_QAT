@@ -2,8 +2,8 @@
 log_level = "INFO"
 dist_params = dict(backend="nccl")
 
-total_batch_size =88    #88
-num_gpus =4      #4
+total_batch_size =20    #88
+num_gpus =1      #4
 batch_size = total_batch_size // num_gpus  #训练用22，debug调试用1
 
 

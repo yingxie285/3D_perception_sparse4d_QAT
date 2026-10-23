@@ -64,6 +64,38 @@ python3 tool/visualization/visulaize_new.py \
 --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/e2e_worklog_0925_use_deformable_func_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_36800.pth
 
+#calib阶段
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+tmux new -s sparse4d_1020QAT_2wframe
+HORIZON_QAT=1 \
+CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 -m torch.distributed.run \
+    --nproc_per_node=1 \
+    --master_port=28671 \
+script/qat_workflow_sparse4d.py \
+--config \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--base-checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
+--phase calib \
+--no-validate \
+--launcher none \
+2>&1 | tee sparse4d_20261023calib算子余弦相似度.log
+
+测试calib保存的权重
+HORIZON_QAT=1 \
+CUDA_VISIBLE_DEVICES=7 \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 script/test_calib.py \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--base-checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
+--checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1023withprepare.ckpt \
+--eval bbox NDS mAP\
+2>&1 | tee eval_data3k_20261023测试calib1023withprepare_iter.log
+
 
 五、QAT 训练
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
