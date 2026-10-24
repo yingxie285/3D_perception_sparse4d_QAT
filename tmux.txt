@@ -66,7 +66,8 @@ python3 tool/visualization/visulaize_new.py \
 
 #calib阶段
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
-tmux new -s sparse4d_1020QAT_2wframe
+tmux new -s sparse4d_1024calib_fisheye
+export QAT_OUTPUT_PREFIX=1024_fisheye_fix
 HORIZON_QAT=1 \
 CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
 PYTHONPATH=$(pwd)/..:$PYTHONPATH \
@@ -81,9 +82,10 @@ script/qat_workflow_sparse4d.py \
 --phase calib \
 --no-validate \
 --launcher none \
-2>&1 | tee sparse4d_20261023calib算子余弦相似度.log
+2>&1 | tee sparse4d_20261024calib_fisheye.log
 
 测试calib保存的权重
+export QAT_OUTPUT_PREFIX=1024_fisheye_fix
 HORIZON_QAT=1 \
 CUDA_VISIBLE_DEVICES=7 \
 PYTHONPATH=$(pwd)/..:$PYTHONPATH \

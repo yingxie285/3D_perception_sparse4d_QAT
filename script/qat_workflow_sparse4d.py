@@ -59,7 +59,7 @@ from qat_utils_sparse4d import (
 
 # Keep the original SparseDrive QAT path-variable style.
 # 允许实验通过环境变量指定独立输出目录，避免覆盖已有 calib.ckpt。
-PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1023withprepare余弦相似度")
+PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1024_fisheye_fix")
 WORK_DIR = "./Sparse4D_QAT/"
 CALIBRATION_CKPT = WORK_DIR + PREFIEX + ".ckpt"
 EXAMPLE_INPUT_PT = WORK_DIR + PREFIEX + "/_example_input.pt"
@@ -95,37 +95,27 @@ def update_scale_by_qtype(model: torch.nn.Module):
 
 
 def get_qconfig_setter(model=None):
-    """
-    Keep the SparseDrive QAT qconfig strategy, but adapt the detection-head
-    module names from:
-
-        head.det_head.layers.*
-
-    to Sparse4D:
-
-        head.layers.*
-
-    Special thresholds are attached dynamically to modules that actually exist
-    in the current Sparse4D implementation, avoiding hard-coded decoder indices.
-    """
-    qconfig_setter = QconfigSetter(
-        get_qconfig(observer=observer_v2.HistogramObserver,fix_scale=False),
-        templates = [
+    """One shared qconfig definition for calibration and test_calib."""
+    return QconfigSetter(
+        get_qconfig(observer=observer_v2.HistogramObserver, fix_scale=False),
+        templates=[
             ModuleNameTemplate({"": torch.float16}),
             ConvDtypeTemplate(input_dtype=qint16, weight_dtype=qint8),
             MatmulDtypeTemplate(input_dtypes=qint16),
-    #------------1008--TODO--把head.layers.0.matmul_test这个算子加上---------------------------
-            ModuleNameTemplate(
-                {
-
-                }
+            # Keep the previous backbone/FPN setting for this geometry repair.
+            ConvDtypeTemplate(
+                input_dtype=qint8,
+                weight_dtype=qint8,
+                prefix=["img_backbone", "img_neck"],
             ),
-            ConvDtypeTemplate(input_dtype=qint8, weight_dtype=qint8, prefix=["img_backbone", "img_neck"]),
-    #-----------------------------------------------------------------------------------
+            ModuleNameTemplate({
+                "head.cam_extrinsic_quant": qint16,
+                "head.cam_intrinsic_quant": qint16,
+                "head.cam_distortion_quant": qint16,
+                "head.metas_image_wh_quant": qint16,
+            }),
         ],
-    )  #TODO #fix_scale 表示尺度固定，校准的时候需要设置为 false，QAT训练的时候设置为 true。
-
-    return qconfig_setter 
+    )
 
 #定义参数
 def parse_args():
@@ -489,25 +479,13 @@ def horizon_calibration(calib_model, data_loader,cfg):
 
     # ⑤ 对比校准前后
     compare_quant_stats(stats_before, stats_after)
-    
-    
-    rank, _ = get_dist_info()
-    if rank == 0:
-        eval_kwargs = cfg.get("evaluation", {}).copy()
-        eval_kwargs.pop("interval", None)
-        eval_kwargs["metric"] = "bbox"
 
-        if eval_kwargs.get("jsonfile_prefix") is None:
-            eval_kwargs["jsonfile_prefix"] = osp.join(
-                "./e2e_worklog_test20261023calib阶段关闭了内部的model.eval()_use_iter36800_deformable_score0.5_3739frame_bevod_val",
-                osp.splitext(osp.basename(cfg.get("filename", "sparse4d")))[0],
-                "eval",
-            )
-
-        results_dict = dataset.evaluate(outputs, **eval_kwargs)
-        print(results_dict)
-
-    torch.save(model.state_dict(), CALIBRATION_CKPT)
+    # Save the unwrapped prepared model, so keys have no "module." prefix.
+    # The evaluation above is a CALIBRATION-mode observation, not the
+    # frozen fake-quant accuracy. Use test_calib.py for the latter.
+    calib_model.eval()
+    set_fake_quantize(calib_model, FakeQuantState.VALIDATION)
+    torch.save(calib_model.state_dict(), CALIBRATION_CKPT)
 #-------------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -536,6 +514,8 @@ def horizon_QAT_test(qat_model, data_loader,cfg):
         print(results_dict)
 
 def quant_analysis(float_model, calib_model, example_input):
+    float_model.eval()
+    calib_model.eval()
     set_fake_quantize(calib_model, FakeQuantState.VALIDATION)
     qa = QuantAnalysis(
         baseline_model=float_model,
@@ -545,6 +525,8 @@ def quant_analysis(float_model, calib_model, example_input):
         out_dir=DEBUG_PATH,
     )
     qa.set_bad_case(example_input)
+    qa.run()
+    qa.compare_per_layer()
 
 
 #--------------------calib阶段--------------
@@ -565,11 +547,13 @@ def run_calib_phase(args, cfg):
 
     calib_model.eval()
 
-    horizon_calibration(calib_model, data_loader,cfg)   #这里不传时序相关的example_input，和test.py一样的逻辑
+    horizon_calibration(calib_model, data_loader,cfg)   #这里不传时序相关的example_input，只需要前向测试
 
     print("[Calibration] checkpoint ->",CALIBRATION_CKPT)
     
-    calib_model.load_state_dict(torch.load(CALIBRATION_CKPT))
+    calib_model.load_state_dict(
+        _load_torch_file(CALIBRATION_CKPT, map_location="cpu"), strict=True
+    )
     quant_analysis(deploy_model, calib_model, example_input) #算子余弦相似度
     
     # horizon_export(calib_model, example_input) #TODO

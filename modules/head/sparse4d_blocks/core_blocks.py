@@ -99,23 +99,10 @@ class DeformableAttentionAggr(BaseModule):
                 embed_dims, num_groups * num_cams * num_levels * self.num_pts
             )
             
-        self.matmul_test = Matmul()
-            
-        #加horizon_init
-        if HORIZON_QAT:
-            self.horizon_init()
+        # Keep camera geometry and feature fusion on independent observers.
+        self.projection_matmul = Matmul()
+        self.fusion_matmul = Matmul()
 
-    def horizon_init(self):
-        # self.float_func_matmul1 = Matmul()  #TODO
-        # self.float_func_matmul2 = Matmul()
-        # self.float_func_add3xy = FloatFunctional()
-        # self.float_func_add3z = FloatFunctional()
-        # self.float_func_add4 = FloatFunctional()
-        # self.float_func_add5 = FloatFunctional()
-        # self.float_func_div = Div()
-        # self.float_func_div_wh = Div()
-        self.matmul_test = Matmul()    
-    
     def init_weight(self):
         constant_init(self.weights_fc, val=0.0, bias=0.0)
         xavier_init(self.output_proj, distribution="uniform", bias=0.0)
@@ -740,7 +727,7 @@ class DeformableAttentionAggr(BaseModule):
         w_bmm = w.permute(0, 1, 3, 4, 2).reshape(N, 1, -1)
         feat_bmm = feat.permute(0, 1, 3, 4, 2, 5).reshape(N, -1, self.group_dims)
 
-        out = self.matmul_test(w_bmm, feat_bmm)
+        out = self.fusion_matmul(w_bmm, feat_bmm)
         out = out.reshape(bs, num_anchor, self.num_pts, self.num_groups, self.group_dims)
         out = out.reshape(bs, num_anchor, self.num_pts, self.embed_dims)
         return out
@@ -858,20 +845,16 @@ class DeformableAttentionAggr(BaseModule):
         image_wh=None,
         fill_value=-1.0,
     ):
-        """
-        key_points: [B, N, M, 3]
-        lidar2cam:  [B, C, 4, 4]
-        K:          [B, C, 3, 3]
-        dist:       [B, C, 4]
-        image_wh:   [B, 2] or [B, C, 2], ordered as [H, W]
-        returns:    [B, C, N, M, 2], normalized as [u/W, v/H]
+        """Fisheye projection without enormous X/Z intermediate values.
+
+        Preserve Z > 1e-6 visibility and the existing [H, W] input convention.
+        This removes known range problems; validate the prepared quantized
+        graph separately because its reciprocal/LUT precision is backend-specific.
         """
         eps = 1e-6
-
-        # [B,C,1,1,3,3] @ [B,1,N,M,3,1] -> [B,C,N,M,3,1]
         rotation = lidar2cam[:, :, None, None, :3, :3]
         points = key_points[:, None, :, :, :, None]
-        cam_xyz = self.matmul_test(rotation, points).squeeze(-1)
+        cam_xyz = self.projection_matmul(rotation, points).squeeze(-1)
         cam_xyz = cam_xyz + lidar2cam[:, :, None, None, :3, 3]
 
         x_cam = cam_xyz[..., 0]
@@ -879,61 +862,66 @@ class DeformableAttentionAggr(BaseModule):
         z_cam = cam_xyz[..., 2]
         valid_depth = z_cam > eps
 
-        safe_z = torch.clamp(z_cam, min=eps)
-        x = x_cam / safe_z
-        y = y_cam / safe_z
+        # Sanitize invalid points BEFORE division, square and sqrt.
+        x = torch.where(valid_depth, x_cam, torch.zeros_like(x_cam))
+        y = torch.where(valid_depth, y_cam, torch.zeros_like(y_cam))
+        z = torch.where(valid_depth, z_cam, torch.ones_like(z_cam))
 
-        radius = torch.sqrt(x * x + y * y)
-        radius = torch.clamp(radius, min=eps)
-        theta = torch.atan(radius)
+        # Common positive rescaling preserves angle and XY direction.
+        # It bounds explicit squared values even for distant anchors.
+        coord_scale = torch.maximum(torch.maximum(torch.abs(x), torch.abs(y)), z)
+        coord_scale = torch.clamp(coord_scale, min=1.0)
+        x = x / coord_scale
+        y = y / coord_scale
+        z = z / coord_scale
+        rho = torch.sqrt(x * x + y * y)
+
+        # atan2(rho, z), using only atan with an input in [0, 1].
+        # Do not calculate both rho/z and z/rho before torch.where.
+        angle_den = torch.maximum(rho, z)
+        angle_den = torch.where(angle_den > 0, angle_den, torch.ones_like(angle_den))
+        ratio = torch.minimum(rho, z) / angle_den
+        small_angle = torch.atan(ratio)
+        theta = torch.where(rho > z, 1.5707963267948966 - small_angle, small_angle)
 
         theta2 = theta * theta
         theta4 = theta2 * theta2
         theta6 = theta4 * theta2
         theta8 = theta4 * theta4
-
         coeffs = dist[:, :, None, None, :]
-        k1 = coeffs[..., 0]
-        k2 = coeffs[..., 1]
-        k3 = coeffs[..., 2]
-        k4 = coeffs[..., 3]
-
         theta_distorted = theta * (
             1.0
-            + k1 * theta2
-            + k2 * theta4
-            + k3 * theta6
-            + k4 * theta8
+            + coeffs[..., 0] * theta2
+            + coeffs[..., 1] * theta4
+            + coeffs[..., 2] * theta6
+            + coeffs[..., 3] * theta8
         )
-        scale = theta_distorted / radius
-        x_distorted = x * scale
-        y_distorted = y * scale
+
+        # rho==0 is the optical axis. Use denominator 1 there, so both
+        # direction components are exactly zero without an unrepresentable eps.
+        direction_den = torch.where(rho > 0, rho, torch.ones_like(rho))
+        x_distorted = (x / direction_den) * theta_distorted
+        y_distorted = (y / direction_den) * theta_distorted
 
         fx = K[:, :, 0, 0][:, :, None, None]
         fy = K[:, :, 1, 1][:, :, None, None]
         cx = K[:, :, 0, 2][:, :, None, None]
         cy = K[:, :, 1, 2][:, :, None, None]
-
         u = fx * x_distorted + cx
         v = fy * y_distorted + cy
         uv = torch.stack((u, v), dim=-1)
-
-        # 保持原实现的语义：先将无效深度点填成 fill_value，再做图像尺寸归一化。
         uv = torch.where(valid_depth.unsqueeze(-1), uv, fill_value)
 
         if image_wh is not None:
             if image_wh.dim() == 2:
-                # [B,2]，输入顺序 [H,W]，坐标顺序是 [u,v]，所以改成 [W,H]
                 wh = torch.stack(
                     (image_wh[:, 1], image_wh[:, 0]), dim=-1
                 )[:, None, None, None, :]
             else:
-                # [B,C,2]
                 wh = torch.stack(
                     (image_wh[:, :, 1], image_wh[:, :, 0]), dim=-1
                 )[:, :, None, None, :]
             uv = uv / wh
-
         return uv
 
 #---------------------------------------0930-------------------------------------
@@ -1012,7 +1000,9 @@ class DeformableAttentionAggr(BaseModule):
         for fm in feature_maps:
             features.append(
                             torch.nn.functional.grid_sample(
-                                fm.flatten(end_dim=1), points_2d
+                                fm.flatten(end_dim=1), points_2d,
+                                mode="bilinear", padding_mode="zeros",
+                                align_corners=False,
                             )
                         )
         features = torch.stack(features, dim=1)
@@ -1291,3 +1281,4 @@ class GridMask(nn.Module):
             x = x * mask
 
         return x.view(n, c, h, w)
+

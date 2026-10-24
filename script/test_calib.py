@@ -60,8 +60,9 @@ from qat_utils_sparse4d import (
     build_test_dataloader,
 )
 import os
+from qat_workflow_sparse4d import get_qconfig_setter, _load_torch_file
 
-PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1023withprepare")
+PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1024_fisheye_fix")
 WORK_DIR = "./Sparse4D_QAT/"
 EXAMPLE_INPUT_PT = WORK_DIR + PREFIEX + "/_example_input.pt"
 
@@ -141,40 +142,6 @@ def prepare_calib_model(inner,example_input,  check_result_dir=None):
     calib_model.eval()
     return calib_model
 
-def get_qconfig_setter(model=None):
-    """
-    Keep the SparseDrive QAT qconfig strategy, but adapt the detection-head
-    module names from:
-
-        head.det_head.layers.*
-
-    to Sparse4D:
-
-        head.layers.*
-
-    Special thresholds are attached dynamically to modules that actually exist
-    in the current Sparse4D implementation, avoiding hard-coded decoder indices.
-    """
-    qconfig_setter = QconfigSetter(
-        get_qconfig(observer=observer_v2.HistogramObserver,fix_scale=False),
-        templates = [
-            ModuleNameTemplate({"": torch.float16}),
-            ConvDtypeTemplate(input_dtype=qint16, weight_dtype=qint8),
-            MatmulDtypeTemplate(input_dtypes=qint16),
-    #------------1008--TODO--把head.layers.0.matmul_test这个算子加上---------------------------
-            ModuleNameTemplate(
-                {
-
-                }
-            ),
-            ConvDtypeTemplate(input_dtype=qint8, weight_dtype=qint8, prefix=["img_backbone", "img_neck"]),
-    #-----------------------------------------------------------------------------------
-        ],
-    )  #TODO #fix_scale 表示尺度固定，校准的时候需要设置为 false，QAT训练的时候设置为 true。
-
-    return qconfig_setter
-
-
 def _move_to_device(value, device):
     """Move tensors in the nested example-input structure to ``device``."""
     if torch.is_tensor(value):
@@ -247,7 +214,10 @@ def main():
     # if fp16_cfg is not None:
     #     wrap_fp16_model(model)
 
-    checkpoint = load_checkpoint(calib_model, args.checkpoint, map_location="cpu") #calib的
+    # This revised workflow saves a raw, unwrapped state_dict.
+    # Strict loading deliberately rejects old graphs and mismatched quantizers.
+    checkpoint = _load_torch_file(args.checkpoint, map_location="cpu")
+    calib_model.load_state_dict(checkpoint, strict=True)
     # print(checkpoint["meta"]["CLASSES"])
     print("args.checkpoint:",args.checkpoint)
 
@@ -276,7 +246,7 @@ def main():
             import os
 
             eval_kwargs["jsonfile_prefix"] = os.path.join(
-                "./e2e_worklog_test20261023测试calibno_DFA_score0.5_3739frame_bevod_val",
+                "./e2e_worklog_test20261024测试calibfisheye_fix_score0.5_3739frame_bevod_val",
                 os.path.splitext(os.path.basename(args.config))[0],
                 "eval",
             )
@@ -297,3 +267,4 @@ def build_module(cfg, default_args: Optional[Dict] = None) -> Any:
 if __name__ == "__main__":
     args = parse_args()
     main()
+

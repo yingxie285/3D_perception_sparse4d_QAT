@@ -125,7 +125,9 @@ class Sparse4DHead(BaseModule):
 
 #---------------------------------------0922--------------------------------
     def horizon_init(self, ):
-        self.metas_projection_mat_quant = QuantStub()
+        self.cam_extrinsic_quant = QuantStub()
+        self.cam_intrinsic_quant = QuantStub()
+        self.cam_distortion_quant = QuantStub()
         self.metas_image_wh_quant = QuantStub()
         # self.cache_confidence_quant = QuantStub()
         
@@ -468,9 +470,9 @@ class Sparse4DHead(BaseModule):
         )
         
         #-------------------------------0922 插quant-TODO---------------------------------
-        metas["cam_extrinsic"] = self.metas_projection_mat_quant(metas["cam_extrinsic"])
-        metas["cam_intrinsic"] = self.metas_projection_mat_quant(metas["cam_intrinsic"])
-        metas["cam_distortion"] = self.metas_projection_mat_quant(metas["cam_distortion"])
+        metas["cam_extrinsic"] = self.cam_extrinsic_quant(metas["cam_extrinsic"])
+        metas["cam_intrinsic"] = self.cam_intrinsic_quant(metas["cam_intrinsic"])
+        metas["cam_distortion"] = self.cam_distortion_quant(metas["cam_distortion"])
         metas["image_wh"] = self.metas_image_wh_quant(metas["image_wh"])
 #-----------------------------------------------------------------------------
         
@@ -865,3 +867,4 @@ class Sparse4DHead(BaseModule):
             model_outs.get("quality"),
             output_idx=output_idx,
         )
+
