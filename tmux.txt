@@ -94,9 +94,9 @@ python3 script/test_calib.py \
 --base-checkpoint \
 /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
 --checkpoint \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1023withprepare.ckpt \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
 --eval bbox NDS mAP\
-2>&1 | tee eval_data3k_20261023测试calib1023withprepare_iter.log
+2>&1 | tee eval_data3k测试calib1024_fisheye_fix.log
 
 
 五、QAT 训练
