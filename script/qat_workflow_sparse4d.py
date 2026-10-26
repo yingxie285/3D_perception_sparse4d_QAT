@@ -59,18 +59,18 @@ from qat_utils_sparse4d import (
 
 # Keep the original SparseDrive QAT path-variable style.
 # 允许实验通过环境变量指定独立输出目录，避免覆盖已有 calib.ckpt。
-PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1024_fisheye_fix")
+PREFIEX = os.environ.get("QAT_OUTPUT_PREFIX", "1025_export")
 WORK_DIR = "./Sparse4D_QAT/"
 CALIBRATION_CKPT = WORK_DIR + PREFIEX + ".ckpt"
 EXAMPLE_INPUT_PT = WORK_DIR + PREFIEX + "/_example_input.pt"
-DEBUG_PATH = WORK_DIR + PREFIEX + "/float_vs_calib3"
+DEBUG_PATH = WORK_DIR + PREFIEX + "/float_vs_calib"
 QAT_BC = WORK_DIR + PREFIEX + "/qat.bc"
 QAT_ONNX = WORK_DIR + PREFIEX + "/qat.onnx"
 QUANTIZE_BC = WORK_DIR + PREFIEX + "/quantize.bc"
 QUANTIZE_ONNX = WORK_DIR + PREFIEX + "/quantize.onnx"
 HBM_PATH = WORK_DIR + PREFIEX + "/model.hbm"
 ADVICE_PATH = WORK_DIR + PREFIEX + "/advice.json"
-output_dir = WORK_DIR + PREFIEX + "qat_export"
+output_dir = WORK_DIR + PREFIEX + "/qat_export"
 
 def update_scale_by_qtype(model: torch.nn.Module):
     for _, m in model.named_modules():
@@ -265,6 +265,7 @@ def _build_deploy_model(cfg, base_checkpoint):
     return model
 
 def horizon_export(calib_model, example_input, args):
+    os.makedirs(args.output_dir, exist_ok=True)
     qat_bc = osp.join(args.output_dir, "qat.bc")
     qat_onnx = osp.join(args.output_dir, "qat.onnx")
     quantize_bc = osp.join(args.output_dir, "quantize.bc")
@@ -556,7 +557,8 @@ def run_calib_phase(args, cfg):
     )
     quant_analysis(deploy_model, calib_model, example_input) #算子余弦相似度
     
-    # horizon_export(calib_model, example_input) #TODO
+    hbm_path = horizon_export(calib_model, example_input, args) #导出HBM
+    print(f"[编译完成] HBM: {osp.abspath(hbm_path)}")
 
     print("[Phase 1] Done.")
 

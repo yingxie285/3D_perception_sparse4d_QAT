@@ -13,6 +13,7 @@ build/
 !/eval_data3k_20261023测试calib1023withprepare_iter.log
 !/eval_data3k测试calib1024_fisheye_fix.log
 !/sparse4d_20261024calib_fisheye.log
+!/sparse4d_202610261006_export.log
 # ===== Checkpoints / Outputs =====
 ckpt/
 data/

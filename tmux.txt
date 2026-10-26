@@ -64,7 +64,8 @@ python3 tool/visualization/visulaize_new.py \
 --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/e2e_worklog_0925_use_deformable_func_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_36800.pth
 
-#calib阶段
+
+#五、calib阶段
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
 tmux new -s sparse4d_1024calib_fisheye
 export QAT_OUTPUT_PREFIX=1024_fisheye_fix
@@ -97,6 +98,47 @@ python3 script/test_calib.py \
 /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
 --eval bbox NDS mAP\
 2>&1 | tee eval_data3k测试calib1024_fisheye_fix.log
+
+
+六、直接calib之后就导出HBM
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+tmux new -s sparse4d_1026_export
+export QAT_OUTPUT_PREFIX=1025_export
+HORIZON_QAT=1 \
+CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 -m torch.distributed.run \
+    --nproc_per_node=1 \
+    --master_port=28671 \
+script/qat_workflow_sparse4d.py \
+--config \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--base-checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
+--phase calib \
+--no-validate \
+--launcher none \
+--skip-onnx \
+2>&1 | tee sparse4d_202610261006_export.log
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 五、QAT 训练
