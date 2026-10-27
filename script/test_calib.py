@@ -68,7 +68,7 @@ EXAMPLE_INPUT_PT = WORK_DIR + PREFIEX + "/_example_input.pt"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train E2E detector")
-    parser.add_argument("config", help="train config file path")
+    parser.add_argument("--config", help="train config file path")
     parser.add_argument(
         "--checkpoint", default="ckpt/sparse4dv3_r50.pth", help="calib的权重"
     )

@@ -34,6 +34,9 @@ def parse_args():
     parser.add_argument(
         "--dataset", default="nuscenes", choices=["nuscenes", "custom"], help="dataset type"
     )
+    parser.add_argument(
+        "--save_dir", default="/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1027", help="保存可视化图片的路径"
+    )
     parser.add_argument("--launcher", choices=["none", "pytorch"], default="none")
     parser.add_argument(
         "--deterministic",
@@ -140,8 +143,9 @@ def main():
         outputs = custom_multi_gpu_test(
             model, data_loader, args.tmpdir, args.gpu_collect
         )
-    save_dir = "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/visualization_20260927use_deformable_score_0.5_3739frame"
+    save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
+    print("save_dir:",save_dir)
     num_samples = len(dataset)
     for index in range(num_samples):
         input_dict = dataset.get_data_info(index)  # 获取字典

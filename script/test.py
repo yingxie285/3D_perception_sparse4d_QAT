@@ -25,6 +25,9 @@ def parse_args():
     parser.add_argument(
         "--checkpoint", default="ckpt/sparse4dv3_r50.pth", help="checkpoint file"
     )
+    parser.add_argument(
+        "--save_dir", default="/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1027", help="保存可视化图片的路径"
+    )
     parser.add_argument("--launcher", choices=["none", "pytorch"], default="none")
     parser.add_argument(
         "--deterministic",
@@ -112,7 +115,7 @@ def main():
             import os
 
             eval_kwargs["jsonfile_prefix"] = os.path.join(
-                "./e2e_worklog_test20261015测试浮点no_DFA_iter_36800_score0.5_3739frame_bevod_val",
+                args.save_dir,
                 os.path.splitext(os.path.basename(args.config))[0],
                 "eval",
             )
