@@ -17,6 +17,8 @@ build/
 # ===== Checkpoints / Outputs =====
 ckpt/
 data/
+vis_pred/
+horizon_j6_open_explorer_v3.8.1-py310_20260326/
 val/
 e2e_worklog_*/
 e2e_worklog/

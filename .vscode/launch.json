@@ -92,7 +92,7 @@
             }
         },
         {
-            "name": "sparse4de2e_test",
+            "name": "sparse4d_test",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/script/test.py",
@@ -113,7 +113,7 @@
             }
         },
         {
-            "name": "sparse4de2e_visual_new",
+            "name": "sparse4de2e_visual_new", // 浮点模型的可视化脚本
             "type": "debugpy",
             "request": "launch",
             "program": "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/tool/visualization/visulaize_new.py",
@@ -122,11 +122,36 @@
                 "--config",
                 "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py", // 配置文件路径
                 "--checkpoint",
-                "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_57150.pth", //
+                "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_57150.pth",
+                "--save_dir",
+                "/home/E2EModel/Model_Train_End/Detection_BEVOD_fisheye-main/vis_pred/0207"
             ],
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
                 "CUDA_VISIBLE_DEVICES": "0",
+            }
+        },
+        {
+            "name": "sparse4d_visual_new_calib", // calib之后的可视化脚本
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/tool/visualization/visulaize_new_calib.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--config",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py", // 配置文件路径
+                "--checkpoint",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt", //
+                "--base-checkpoint",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth",
+                "--save_dir",
+                "/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1028"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/..:${env:PYTHONPATH}",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HORIZON_QAT": "1",
+                "QAT_OUTPUT_PREFIX": "1024_fisheye_fix"
             }
         },
         {
