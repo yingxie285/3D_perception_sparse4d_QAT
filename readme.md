@@ -101,11 +101,11 @@ python3 script/test_calib.py \
 2>&1 | tee eval_data3k测试calib1024_fisheye_fix.log
 
 ## 三、calib测试可视化
-与test_calib.py逻辑一致，visulaize_new.py此脚本是得到可视化图片。
+与test_calib.py逻辑一致，visulaize_new_calib.py此脚本是得到可视化图片。
 需替换实际的save_dir、checkpoint的路径。参考命令：
 CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=$(pwd):$PYTHONPATH \
-python3 tool/visualization/visulaize_new.py \
+python3 tool/visualization/visulaize_new_calib.py \
 --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
 --save_dir /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1028 \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
