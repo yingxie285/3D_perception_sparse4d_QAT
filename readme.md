@@ -111,6 +111,28 @@ python3 tool/visualization/visulaize_new_calib.py \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
 --base-checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth
 
+## 四、生成demo数据文件夹，以供板端测试
+### 1. 服务器生成 100 帧数据
+export REPO_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+export SDK_ROOT="$REPO_ROOT/horizon_j6_open_explorer_v3.8.1-py310_20260326"
+
+cd "$SDK_ROOT/samples/ucp_tutorial/all-round"
+
+python3 tools/sparse4d/export_demo.py \
+  --repo-root="$REPO_ROOT" \
+  --ann-path="$REPO_ROOT/data/BEVOD_nusc_anno_dumpjson_mini/val" \
+  --image-root="$REPO_ROOT/data/fisheye_data_2w_frame" \
+  --output-dir="$PWD/data/sparse4d/demo_100frames" \
+  --num-frames=100
+默认将标注按时间戳排序，从第一帧开始取 总计 100 帧，每帧复制前、右、左、后四张图片。
+
+若只想导出一个场景，将 --ann-path 改为：
+--ann-path="$REPO_ROOT/data/BEVOD_nusc_anno_dumpjson_mini/val/20240119-211122_20240119-211139.json"
+
+### 2. 使用MobaXterm软件连接域控制器和PC电脑，将100 帧数据的文件夹（demo_100frames）拷贝到板端
+为避免文件丢失，使用zip把demo_100frames文件夹压缩后，再拖动到板端，并解压zip。
+
+
 
 # J6部署-板端
 在服务器里进行交叉编译，以生成板端能运行的产物。
@@ -160,7 +182,7 @@ mkdir -p "$PACKAGE_ROOT/configs"
 cp "$SDK_ROOT/samples/ucp_tutorial/dnn/basic_samples/code/sparse4d_J6M/assets/model.hbm" \
    "$PACKAGE_ROOT/model/model.hbm"
 
-cp -a "$SAMPLE_ROOT/data/sparse4d/frame_000" \
+cp -a "$SAMPLE_ROOT/data/sparse4d/demo_100frames" \
       "$PACKAGE_ROOT/data/"
 
 cp "$SAMPLE_ROOT/configs/sparse4d/model_io.json" \
@@ -170,32 +192,37 @@ aarch64/
 ├── bin/
 │   ├── sparse4d_J6M
 │   └── run_sparse4d.sh
-├── lib/                         # 构建安装的 aarch64 运行库
+├── lib/                              # aarch64 运行库
 ├── model/
 │   └── model.hbm
 ├── configs/
 │   └── model_io.json
 └── data/
-    └── frame_000/
-        ├── frame.json           # 包含内外参、畸变和预处理配置
-        ├── images/              # 同一帧的四张图片
-        ├── reference_inputs.json
-        └── reference_inputs/
+    └── demo_100frames/
+        ├── manifest.json             # 100 帧配置文件的相对路径列表
+        ├── dataset.json              # 帧数、场景、token、时间戳
+        └── frames/
+            ├── frame_000000/
+            │   ├── frame.json        # 当前帧标定、畸变、预处理及图片路径
+            │   └── images/
+            │       ├── 00_FISHEYE_CAM_FRONT.jpeg
+            │       ├── 01_FISHEYE_CAM_RIGHT.jpeg
+            │       ├── 02_FISHEYE_CAM_LEFT.jpeg
+            │       └── 03_FISHEYE_CAM_BACK.jpeg
+            ├── frame_000001/
+            │   ├── frame.json
+            │   └── images/
+            │       └── …             # 当前帧四张图片
+            ├── …
+            └── frame_000099/
+                ├── frame.json
+                └── images/
+                    └── …             # 当前帧四张图片
 
 ## 5. 将部署包拷贝到域控制器运行
-使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录。
-板端先执行前处理
-cd /app/aarch64
+使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/）。
 
-bash bin/run_sparse4d.sh \
-  --manifest="$PWD/data/frame_000/frame.json" \
-  --dump_dir="$PWD/output_preprocess" \
-  --preprocess_only=true
-这一步读取四路图片并生成七个输入，不执行 HBM。正常结束后，应存在：
-ls -lh output_preprocess/inputs/
-cat output_preprocess/timing.json
-
-## 6. 板端执行单帧完整推理
+## 6. 板端执行100帧完整推理
 cd /app/aarch64
 set -o pipefail
 
@@ -203,30 +230,26 @@ bash bin/run_sparse4d.sh \
   --model_file="$PWD/model/model.hbm" \
   --model_name=forward \
   --model_io="$PWD/configs/model_io.json" \
-  --manifest="$PWD/data/frame_000/frame.json" \
-  --dump_dir="$PWD/output_j6m" \
+  --manifest="$PWD/data/demo_100frames/manifest.json" \
+  --dump_dir="$PWD/output_100frames" \
+  --num_frames=-1 \
   --warmup=0 \
   --repeat=1 \
-  --core_id=0 \
   --save_outputs=true \
-  --dump_inputs=true \
   --visualize=true \
   --visualize_score_threshold=0.5 \
+  --dump_inputs=false \
   --trace=true \
-  2>&1 | tee run_j6m.log
+  2>&1 | tee run_100frames.log
 这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
 
-成功时，应看到 RunInfer RETURN rc=0，并生成：
-output_j6m/
-├── hbm_interface.json
-├── raw_outputs.json
-├── output_0.bin
-├── output_1.bin
-├── classification_f32.bin
-├── prediction_f32.bin
-├── detections.json
-├── four_cameras.jpg
-├── bev.jpg
-└── timing.json
+成功时，并生成：
+aarch64/
+├── run_100frames.log
+└── output_100frames/
+    ├── 0/                            # 第一帧结果
+    ├── 1/
+    ├── …
+    └── 99/                           # 第100帧结果
 
 # 更换域控制器（J6M换成J6P）

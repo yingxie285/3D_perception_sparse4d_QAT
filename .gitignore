@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.so
+*.hbm
 *.egg-info/
 dist/
 build/
@@ -18,7 +19,18 @@ build/
 ckpt/
 data/
 vis_pred/
-horizon_j6_open_explorer_v3.8.1-py310_20260326/
+# 放行 SDK 目录本身，但仍忽略其全部内容
+!/horizon_j6_open_explorer_v3.8.1-py310_20260326/
+/horizon_j6_open_explorer_v3.8.1-py310_20260326/*
+
+# 逐层放行至 all-round
+!/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/
+/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/*
+
+!/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/
+/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/*
+
+!/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round/
 val/
 e2e_worklog_*/
 e2e_worklog/
