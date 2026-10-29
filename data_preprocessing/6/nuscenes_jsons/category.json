@@ -1,0 +1,67 @@
+[
+    {
+        "token": "",
+        "name": "car",
+        "description": "普通轿车, 敞篷轿车, SUV, MPV,面包车,皮卡,警车,救护车,房车,其他机动车,未知机动车,未知机动车车轮,未知机动车车灯."
+    },
+    {
+        "token": "",
+        "name": "truck",
+        "description": "房车,普通小型货车,箱式小型货车,普通大型货车,轿运车."
+    },
+    {
+        "token": "",
+        "name": "bus",
+        "description": "客车,校车, 普通公交车, 铰链公交车, 有轨电车,无轨电车."
+    },
+    {
+        "token": "",
+        "name": "construction_vehicle",
+        "description": "消防车,清洁车,工程车,拖车,拖拉机,叉车,油罐车."
+    },
+    {
+        "token": "",
+        "name": "pedestrian",
+        "description": "成人,儿童,交警,环卫工人,道路施工人员."
+    },
+    {
+        "token": "",
+        "name": "motor",
+        "description": "两轮摩托,三轮摩托."
+    },
+    {
+        "token": "",
+        "name": "bicycle",
+        "description": "两轮电动车,三轮电动车,两轮自行车,三轮自行车,滑板车,平衡车,婴儿车,轮椅,平板小推车,超市购物车,手推车,其他非机动车,未知非机动车,非机动车组."
+    },
+    {
+        "token": "",
+        "name": "animal",
+        "description": "小型动物,大型动物."
+    },
+    {
+        "token": "",
+        "name": "traffic_cone",
+        "description": "锥桶."
+    },
+    {
+        "token": "",
+        "name": "barrier",
+        "description": "防撞桶,路桩,石墩,水马,柱子,石块,树枝/树杈,空中漂浮物,路坑/水洼,其他静态障碍物."
+    },
+    {
+        "token": "",
+        "name": "stopper",
+        "description": "车位停止器,车位锁,减速带."
+    },
+    {
+        "token": "",
+        "name": "trash_bin",
+        "description": "垃圾桶,灭火器,箱子."
+    },
+    {
+        "token": "",
+        "name": "sign",
+        "description": "A字牌,三角牌,施工警示牌,道闸杆."
+    }
+]

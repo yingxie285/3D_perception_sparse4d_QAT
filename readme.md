@@ -4,20 +4,20 @@
 2、确定百度数据集有几套内外参（对应几个数据采集车）：运行tool/data_converter/collect_unique_camera_config.py，可以知道有4套内外参，也就相当于4辆不同的数据采集车。因此，需要为每一帧每一个相机都用自己独自的内外参，后续的数据预处理脚本已实现这个功能。运行前，把第5行root_dir的路径换成您的路径（data/fisheye_data_2w_frame，这里面是按场景排列的数据）。
 
 ## 二、模型需要的数据预处理
-1、运行sparse4d/6/offline_data_aug.py得到数据增强后的真值数据集。将百度数据集的点云从pcd格式转化成npy格式。此脚本会在原路径下生成新的npy格式的点云，不会覆盖原有pcd格式的点云。npy格式的点云数据IO的速度更快，且模型读取的是npy格式的点云，因此要转换。
+1、运行data_preprocessing/6/offline_data_aug.py得到数据增强后的真值数据集。将百度数据集的点云从pcd格式转化成npy格式。此脚本会在原路径下生成新的npy格式的点云，不会覆盖原有pcd格式的点云。npy格式的点云数据IO的速度更快，且模型读取的是npy格式的点云，因此要转换。
 
-2、真值可视化验证：验证数据集的3D框真值投影到图像上是不是对的，运行sparse4d/6/vis_gt_label.py。只看前3个场景
+2、真值可视化验证：验证数据集的3D框真值投影到图像上是不是对的，运行 data_preprocessing/6/vis_gt_label.py。只看前3个场景
 
-3、运行sparse4d/6/bevod_split_dataset.py，会得到划分数据集的data_info.json。
+3、运行data_preprocessing/6/bevod_split_dataset.py，会得到划分数据集的data_info.json。
 
-4、运行sparse4d/6/bevod_to_nuscenes.py，会在data/nuscenes_format生成Nuscenes形式的json。（注意：最好不要点击生成的data/nuscenes_format/v1.0-trainval/sample_annotation.json，因为真值标签很多，这个json比较大，vs code可能会卡住。您可以用命令ls -lh sample_annotation.json的路径来看sample_annotation.json的内存是多大）
+4、运行data_preprocessing/6/bevod_to_nuscenes.py，会在data/nuscenes_format生成Nuscenes形式的json。（注意：最好不要点击生成的data/nuscenes_format/v1.0-trainval/sample_annotation.json，因为真值标签很多，这个json比较大，vs code可能会卡住。您可以用命令ls -lh sample_annotation.json的路径来看sample_annotation.json的内存是多大）
 
-5、运行sparse4d/6/BEVOD_dump_nusc_ann_json_mini.py，将Nuscenes形式转成dump形式，模型需要dump形式。
+5、运行data_preprocessing/6/BEVOD_dump_nusc_ann_json_mini.py，将Nuscenes形式转成dump形式，模型需要dump形式。
 运行前需要在BEVOD_dump_nusc_ann_json_mini.py的create_nuscenes_infos函数里，点击train_scenes = splits.bevod_train中的bevod_train和
 val_scenes = splits.bevod_val中的bevod_val。
 进入dataset/utils/custom_nuscenes/utils/splits.py更改bevod_train和bevod_val，确认bevod_train和bevod_val的场景划分，保持和train_val_split.json一致（其实就是把train_val_split.json的[]里面的内容对应复制到dataset/utils/custom_nuscenes/utils/splits.py的bevod_train和bevod_val的全局变量定义，覆盖之前的bevod_train和bevod_val的内容）其中，bevod_train就是train_val_split.json里面的"train"，bevod_val就是train_val_split.json里面的"val"，更改后按ctrl+S保存。
 
-6、运行sparse4d/6/nusc_anchor_generator.py，得到初始化的anchor（bevod_kmeans900.npy）。
+6、运行data_preprocessing/6/nusc_anchor_generator.py，得到初始化的anchor（bevod_kmeans900.npy）。
 
 # 浮点训练
 ## 一、检查config
