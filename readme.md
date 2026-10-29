@@ -60,7 +60,7 @@ python tool/visualization/visulaize_new.py \
 4、特征采样的投影函数，路径在modules/head/sparse4d_blocks/core_blocks.py
 
 
-# J6部署
+# J6部署-服务器端
 ## 一、calib阶段
 运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
 需替换实际的config与base-checkpoint的路径，以及日志的名字。参考命令：
@@ -110,3 +110,123 @@ python3 tool/visualization/visulaize_new_calib.py \
 --save_dir /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1028 \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
 --base-checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth
+
+
+# J6部署-板端
+在服务器里进行交叉编译，以生成板端能运行的产物。
+## 1. 服务器设置路径
+确保本地最新的 all-round 已上传到服务器，然后执行：
+export SDK_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326
+export SAMPLE_ROOT="$SDK_ROOT/samples/ucp_tutorial/all-round"
+
+cd "$SAMPLE_ROOT"
+
+## 2. 检查交叉编译器
+下面是参考工程使用的默认路径。如果实际安装位置不同，只修改这一行：
+export LINARO_GCC_ROOT=/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-linux-gnu
+
+"$LINARO_GCC_ROOT/bin/aarch64-none-linux-gnu-g++" --version
+"$LINARO_GCC_ROOT/bin/aarch64-none-linux-gnu-g++" -dumpmachine
+第二条应输出：
+aarch64-none-linux-gnu
+如果文件不存在，查找实际位置：
+find /opt /usr/local /home /data1 / \
+  -maxdepth 5 -name aarch64-none-linux-gnu-g++ 2>/dev/null
+
+## 3. 检查依赖并编译
+ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/ucp/lib"
+ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/opencv/lib"
+ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/gflags/lib"
+
+cd "$SAMPLE_ROOT"
+bash build_sparse4d_aarch64.sh
+编译、安装完成后检查：
+file deploy/sparse4d/aarch64/bin/sparse4d_J6M
+ls -lh deploy/sparse4d/aarch64/bin/
+ls -lh deploy/sparse4d/aarch64/lib/
+file 输出应包含 ARM aarch64，不能是 x86-64。
+
+这个构建使用独立的 build_sparse4d_aarch64 目录，不影响已经编译的 x86 程序。
+
+## 4. 在服务器整理完整部署包
+直接在安装目录补上模型和数据：
+cd "$SAMPLE_ROOT"
+export PACKAGE_ROOT="$SAMPLE_ROOT/deploy/sparse4d/aarch64"
+
+mkdir -p "$PACKAGE_ROOT/model"
+mkdir -p "$PACKAGE_ROOT/data"
+mkdir -p "$PACKAGE_ROOT/configs"
+
+cp "$SDK_ROOT/samples/ucp_tutorial/dnn/basic_samples/code/sparse4d_J6M/assets/model.hbm" \
+   "$PACKAGE_ROOT/model/model.hbm"
+
+cp -a "$SAMPLE_ROOT/data/sparse4d/frame_000" \
+      "$PACKAGE_ROOT/data/"
+
+cp "$SAMPLE_ROOT/configs/sparse4d/model_io.json" \
+   "$PACKAGE_ROOT/configs/model_io.json"
+部署包应包含：
+aarch64/
+├── bin/
+│   ├── sparse4d_J6M
+│   └── run_sparse4d.sh
+├── lib/                         # 构建安装的 aarch64 运行库
+├── model/
+│   └── model.hbm
+├── configs/
+│   └── model_io.json
+└── data/
+    └── frame_000/
+        ├── frame.json           # 包含内外参、畸变和预处理配置
+        ├── images/              # 同一帧的四张图片
+        ├── reference_inputs.json
+        └── reference_inputs/
+
+## 5. 将部署包拷贝到域控制器运行
+使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录。
+板端先执行前处理
+cd /app/aarch64
+
+bash bin/run_sparse4d.sh \
+  --manifest="$PWD/data/frame_000/frame.json" \
+  --dump_dir="$PWD/output_preprocess" \
+  --preprocess_only=true
+这一步读取四路图片并生成七个输入，不执行 HBM。正常结束后，应存在：
+ls -lh output_preprocess/inputs/
+cat output_preprocess/timing.json
+
+## 6. 板端执行单帧完整推理
+cd /app/aarch64
+set -o pipefail
+
+bash bin/run_sparse4d.sh \
+  --model_file="$PWD/model/model.hbm" \
+  --model_name=forward \
+  --model_io="$PWD/configs/model_io.json" \
+  --manifest="$PWD/data/frame_000/frame.json" \
+  --dump_dir="$PWD/output_j6m" \
+  --warmup=0 \
+  --repeat=1 \
+  --core_id=0 \
+  --save_outputs=true \
+  --dump_inputs=true \
+  --visualize=true \
+  --visualize_score_threshold=0.5 \
+  --trace=true \
+  2>&1 | tee run_j6m.log
+这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
+
+成功时，应看到 RunInfer RETURN rc=0，并生成：
+output_j6m/
+├── hbm_interface.json
+├── raw_outputs.json
+├── output_0.bin
+├── output_1.bin
+├── classification_f32.bin
+├── prediction_f32.bin
+├── detections.json
+├── four_cameras.jpg
+├── bev.jpg
+└── timing.json
+
+# 更换域控制器（J6M换成J6P）
