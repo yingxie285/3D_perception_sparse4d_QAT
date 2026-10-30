@@ -15,7 +15,7 @@ data/
 
 3. 运行data_preprocessing/bevod_to_nuscenes.py，会在data/nuscenes_format生成Nuscenes形式的json。运行前记得确认info_root、data_root、save_root的路径对不对，以及def parse_args():函数里的'--local-root'和'--workers'。（注意：最好不要点击生成的data/nuscenes_format/v1.0-trainval/sample_annotation.json，因为真值标签很多，这个json比较大，vs code可能会卡住。您可以用命令ls -lh sample_annotation.json的路径来看sample_annotation.json的内存是多大）
 
-4. 运行data_preprocessing/6/BEVOD_dump_nusc_ann_json_mini.py，将Nuscenes形式转成dump形式，模型需要dump形式。
+4. 运行data_preprocessing/BEVOD_dump_nusc_ann_json_mini.py，将Nuscenes形式转成dump形式，模型需要dump形式。
 运行前需要检查BEVOD_dump_nusc_ann_json_mini.py的第402行create_nuscenes_infos函数里，点击train_scenes = splits.bevod_train中的bevod_train和
 val_scenes = splits.bevod_val中的bevod_val。【Pylance插件有用就能自动进入splits.py，插件没用就手动点击dataset/utils/custom_nuscenes/utils/splits.py】。
 进入dataset/utils/custom_nuscenes/utils/splits.py找到第151行bevod_train和bevod_val，确认bevod_train和bevod_val的场景划分，保持和train_val_split.json一致（其实就是把train_val_split.json的[]里面的内容对应复制到dataset/utils/custom_nuscenes/utils/splits.py的bevod_train和bevod_val的全局变量定义，覆盖之前的bevod_train和bevod_val的内容）其中，bevod_train就是train_val_split.json里面的"train"，bevod_val就是train_val_split.json里面的"val"，如果更改了就要按ctrl+S保存。
