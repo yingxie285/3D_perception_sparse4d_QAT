@@ -1,3 +1,12 @@
+# 目录
+- [数据预处理](#数据预处理)
+- [浮点训练](#浮点训练)
+- [浮点测试](#浮点测试)
+- [J6部署-服务器端](#J6部署-服务器端)
+- [J6部署-板端](#J6部署-板端)
+- [更换域控制器（J6M换成J6P）](#更换域控制器（J6M换成J6P）)
+
+
 # 数据预处理
 ## 一、检查并准备百度原始数据集
 1. 真值可视化验证：验证原始数据集的3D框真值投影到图像上是不是对的，运行tool/visualization/vis_gt_label.py，运行前更改第167行dataset_dir数据集路径、第171行可视化图片保存路径save_dir。
@@ -356,10 +365,12 @@ ls ../deps_aarch64
 
 2. 修改 all-round-j6p/CMakeLists.txt
 打开all-round-j6p/CMakeLists.txt，其中用到了命名的地方已更改为sparse4d_J6P与J6P，如下所示：
+```bash
 add_executable(sparse4d_J6P src/sparse4d/main.cc src/sparse4d/sparse4d_runtime.cc)
 target_link_libraries(sparse4d_J6P dnn hbucp gflags opencv_world pthread dl rt)
 set_target_properties(sparse4d_J6P PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 install(TARGETS sparse4d_J6P DESTINATION bin)
+```
 SPARSE4D_ARCH=aarch64 保持原样。它描述的是 CPU 架构，并不是模型的 nash-m 或 nash-p。
 
 3. 修改 all-round-j6p/run_sparse4d.sh
