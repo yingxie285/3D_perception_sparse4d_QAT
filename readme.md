@@ -295,6 +295,9 @@ aarch64/
     ├── …
     └── 99/                           # 第100帧结果
 ```
+## 7. 检测结果回放
+将板端生成的output_100frames拷贝至PC电脑或者服务器里，运行tool/visualization/output_100frames_to_mp4.py脚本，可以将图片变成视频，方便查阅效果。运行前更改第12行input_dir和第13行output_mp4的路径。
+
 
 # 更换域控制器（J6M换成J6P）
 有两个必须分开的改动：
@@ -481,3 +484,5 @@ aarch64/
     ├── …
     └── 99/                           # 第100帧结果
 ```
+
+4. 将板端生成的output_j6p_100frames拷贝至PC电脑或者服务器里，运行tool/visualization/output_100frames_to_mp4.py脚本，可以将图片变成视频，方便查阅效果。运行前更改第12行input_dir和第13行output_mp4的路径。

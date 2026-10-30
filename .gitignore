@@ -6,7 +6,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
+output_100frames/
+*.mp4
 # ===== Logs =====
 *.log
 # 保留指定的日志文件
