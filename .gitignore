@@ -15,6 +15,7 @@ build/
 !/eval_data3k测试calib1024_fisheye_fix.log
 !/sparse4d_20261024calib_fisheye.log
 !/sparse4d_202610261006_export.log
+!/sparse4d_20261030calib_J6P_export.log
 # ===== Checkpoints / Outputs =====
 ckpt/
 data/
@@ -31,6 +32,8 @@ vis_pred/
 /horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/*
 
 !/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round/
+!/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p/
+
 val/
 e2e_worklog_*/
 e2e_worklog/

@@ -46,12 +46,14 @@ source 环境路径
 3、更改第143行save_dir = "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/visualization_0104_pred_0.5_epoch83"为您的保存路径。
 4、运行launch.json里的tool/visualization/visulaize_new.py
 （注：模型test用的得分阈值是0.5，如果要修改得分阈值，在modules/head/decoder/decoder.py第15行，修改score_threshold得分阈值）
-参考命令：CUDA_VISIBLE_DEVICES=1 \
+参考命令：
+```bash
+CUDA_VISIBLE_DEVICES=1 \
 PYTHONPATH=$(pwd):$PYTHONPATH \
 python tool/visualization/visulaize_new.py \
 --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
 --checkpoint e2e_worklog_0207_all_camera_config_no_quality/sparse4dv3_temporal_r50_1x8_bs6_256x704/iter_57150.pth
-
+```
 
 ## 附：代码主要更改说明（详见飞书文档）：
 1、config的更改
@@ -64,6 +66,7 @@ python tool/visualization/visulaize_new.py \
 ## 一、calib阶段
 运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
 需替换实际的config与base-checkpoint的路径，以及日志的名字。参考命令：
+```bash
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
 tmux new -s sparse4d_1024calib_fisheye
 export QAT_OUTPUT_PREFIX=1024_fisheye_fix
@@ -79,13 +82,16 @@ script/qat_workflow_sparse4d.py \
 --base-checkpoint \
 /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
 --phase calib \
+--march nash-m \
 --no-validate \
 --launcher none \
 2>&1 | tee sparse4d_20261024calib_fisheye.log
+```
 
 ## 二、测试calib阶段保存的权重
 运行下面的命令会测试calib阶段保存的权重,得到测试集的精度结果，作为定点模型的结果与浮点模型的结果进行对比。
 需替换实际的config、base-checkpoint、calib权重（ckpt）的路径，以及日志的名字。参考命令：
+```bash
 export QAT_OUTPUT_PREFIX=1024_fisheye_fix
 HORIZON_QAT=1 \
 CUDA_VISIBLE_DEVICES=7 \
@@ -97,22 +103,28 @@ python3 script/test_calib.py \
 /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
 --checkpoint \
 /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
+--march nash-m \
 --eval bbox NDS mAP\
 2>&1 | tee eval_data3k测试calib1024_fisheye_fix.log
+```
 
 ## 三、calib测试可视化
 与test_calib.py逻辑一致，visulaize_new_calib.py此脚本是得到可视化图片。
 需替换实际的save_dir、checkpoint的路径。参考命令：
+```bash
 CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=$(pwd):$PYTHONPATH \
 python3 tool/visualization/visulaize_new_calib.py \
 --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
 --save_dir /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1028 \
+--march nash-m \
 --checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
 --base-checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth
+```
 
 ## 四、生成demo数据文件夹，以供板端测试
 ### 1. 服务器生成 100 帧数据
+```bash
 export REPO_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
 export SDK_ROOT="$REPO_ROOT/horizon_j6_open_explorer_v3.8.1-py310_20260326"
 
@@ -124,6 +136,7 @@ python3 tools/sparse4d/export_demo.py \
   --image-root="$REPO_ROOT/data/fisheye_data_2w_frame" \
   --output-dir="$PWD/data/sparse4d/demo_100frames" \
   --num-frames=100
+```
 默认将标注按时间戳排序，从第一帧开始取 总计 100 帧，每帧复制前、右、左、后四张图片。
 
 若只想导出一个场景，将 --ann-path 改为：
@@ -133,45 +146,55 @@ python3 tools/sparse4d/export_demo.py \
 为避免文件丢失，使用zip把demo_100frames文件夹压缩后，再拖动到板端，并解压zip。
 
 
-
 # J6部署-板端
 在服务器里进行交叉编译，以生成板端能运行的产物。
 ## 1. 服务器设置路径
 确保本地最新的 all-round 已上传到服务器，然后执行：
+```bash
 export SDK_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326
 export SAMPLE_ROOT="$SDK_ROOT/samples/ucp_tutorial/all-round"
 
 cd "$SAMPLE_ROOT"
+```
 
 ## 2. 检查交叉编译器
 下面是参考工程使用的默认路径。如果实际安装位置不同，只修改这一行：
+```bash
 export LINARO_GCC_ROOT=/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-linux-gnu
-
+```
+```bash
 "$LINARO_GCC_ROOT/bin/aarch64-none-linux-gnu-g++" --version
 "$LINARO_GCC_ROOT/bin/aarch64-none-linux-gnu-g++" -dumpmachine
-第二条应输出：
-aarch64-none-linux-gnu
+```
+第二条应输出：aarch64-none-linux-gnu
 如果文件不存在，查找实际位置：
+```bash
 find /opt /usr/local /home /data1 / \
   -maxdepth 5 -name aarch64-none-linux-gnu-g++ 2>/dev/null
+```
 
 ## 3. 检查依赖并编译
+```bash
 ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/ucp/lib"
 ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/opencv/lib"
 ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/gflags/lib"
 
 cd "$SAMPLE_ROOT"
 bash build_sparse4d_aarch64.sh
+```
 编译、安装完成后检查：
+```bash
 file deploy/sparse4d/aarch64/bin/sparse4d_J6M
 ls -lh deploy/sparse4d/aarch64/bin/
 ls -lh deploy/sparse4d/aarch64/lib/
+```
 file 输出应包含 ARM aarch64，不能是 x86-64。
 
 这个构建使用独立的 build_sparse4d_aarch64 目录，不影响已经编译的 x86 程序。
 
 ## 4. 在服务器整理完整部署包
 直接在安装目录补上模型和数据：
+```bash
 cd "$SAMPLE_ROOT"
 export PACKAGE_ROOT="$SAMPLE_ROOT/deploy/sparse4d/aarch64"
 
@@ -187,6 +210,7 @@ cp -a "$SAMPLE_ROOT/data/sparse4d/demo_100frames" \
 
 cp "$SAMPLE_ROOT/configs/sparse4d/model_io.json" \
    "$PACKAGE_ROOT/configs/model_io.json"
+```
 部署包应包含：
 aarch64/
 ├── bin/
@@ -223,6 +247,7 @@ aarch64/
 使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/）。
 
 ## 6. 板端执行100帧完整推理
+```bash
 cd /app/aarch64
 set -o pipefail
 
@@ -241,9 +266,10 @@ bash bin/run_sparse4d.sh \
   --dump_inputs=false \
   --trace=true \
   2>&1 | tee run_100frames.log
+```
 这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
 
-成功时，并生成：
+成功会生成：
 aarch64/
 ├── run_100frames.log
 └── output_100frames/
@@ -252,4 +278,185 @@ aarch64/
     ├── …
     └── 99/                           # 第100帧结果
 
+
 # 更换域控制器（J6M换成J6P）
+有两个必须分开的改动：
+1. 在服务器里用 nash-p 重新编译模型，得到 J6P 的 HBM。
+2. 复制一份 all-round 部署工程，修改程序名和启动脚本，再交叉编译、打包到 J6P域控制器。
+
+## 一、用 nash-p 重新编译模型
+在script/qat_workflow_sparse4d.py脚本里是通过参数parser.add_argument("--march", )定义的，需通过命令显式传入nash-p。
+运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
+需替换实际的config与base-checkpoint的路径，以及日志的名字。设置独立的 QAT_OUTPUT_PREFIX 和 --output-dir 是为了不覆盖已有的J6M的model.hbm、qat.bc 和 quantize.bc。参考命令：
+```bash
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+tmux new -s sparse4d_calib_fisheye_J6P
+export QAT_OUTPUT_PREFIX=J6P_export
+HORIZON_QAT=1 \
+CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
+PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+python3 -m torch.distributed.run \
+    --nproc_per_node=1 \
+    --master_port=28671 \
+script/qat_workflow_sparse4d.py \
+--config \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+--base-checkpoint \
+/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
+--phase calib \
+--march nash-p \
+--no-validate \
+--launcher none \
+2>&1 | tee sparse4d_20261030calib_J6P_export.log
+```
+产物为：/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/J6P_export/qat_export/model.hbm
+
+
+## 二、交叉编译出J6P的部署工程
+1. 在服务器复制工程
+以下命令在存放完整 SDK 的 Linux 服务器执行。先按你的实际路径修改 SDK_ROOT：
+```bash
+export SDK_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326
+export UCP_ROOT="$SDK_ROOT/samples/ucp_tutorial"
+
+cd "$UCP_ROOT"
+```
+
+保留已经通过 J6M 板端验证的目录。
+```bash
+cp -a all-round all-round-j6p
+cd all-round-j6p
+```
+这会复制源码、构建脚本以及目录中现有的数据和构建产物。因此不要直接把旧的 deploy/sparse4d/aarch64 当成 J6P 部署包。下文会让新工程重新构建，并在打包时明确放入新 HBM。
+复制后先确认文件：
+```bash
+ls CMakeLists.txt build_sparse4d_aarch64.sh run_sparse4d.sh
+ls ../deps_aarch64
+```
+
+2. 修改 all-round-j6p/CMakeLists.txt
+打开all-round-j6p/CMakeLists.txt，其中用到了命名的地方已更改为sparse4d_J6P与J6P，如下所示：
+add_executable(sparse4d_J6P src/sparse4d/main.cc src/sparse4d/sparse4d_runtime.cc)
+target_link_libraries(sparse4d_J6P dnn hbucp gflags opencv_world pthread dl rt)
+set_target_properties(sparse4d_J6P PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+install(TARGETS sparse4d_J6P DESTINATION bin)
+SPARSE4D_ARCH=aarch64 保持原样。它描述的是 CPU 架构，并不是模型的 nash-m 或 nash-p。
+
+3. 修改 all-round-j6p/run_sparse4d.sh
+run_sparse4d.sh第5行和第6行已修改为J6P的命名，如下所示：
+export HB_UCP_SIM_PLATFORM_TYPE=nash-p
+exec "$bin/sparse4d_J6P" "$@"
+
+4. horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p/src/sparse4d/sparse4d_runtime.cc原本的sparse4d_J6M，用于诊断日志和报错前缀。已改成 sparse4d_J6P，便于区分两次板端测试。这两处文字不决定硬件目标。注释中的J6M也已改为J6P。
+
+5. 检查还有没有J6M字样
+在复制出的工程执行：
+```bash
+cd "$UCP_ROOT/all-round-j6p"
+
+rg -n 'nash-m|sparse4d_J6M|J6M' \
+  CMakeLists.txt run_sparse4d.sh src include configs tools \
+  build_sparse4d_aarch64.sh build_sparse4d_x86.sh
+```
+允许只剩 export_demo.py 的 J6M/J6P 说明。
+
+6. 清理复制来的 J6M 构建缓存和部署产物，必须确认是在all-round-j6p的文件夹
+```bash
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p
+pwd
+```
+pwd 的末尾必须是 /all-round-j6p。确认当前目录后，只删除 J6P 副本内的这两个生成目录：
+```bash
+rm -rf -- ./build_sparse4d_aarch64 ./deploy/sparse4d/aarch64
+```
+其中 build_sparse4d_aarch64 含复制来的 CMake 缓存；deploy/sparse4d/aarch64 可能含旧的 J6M 程序、库和模型，因此需要清理。src/、include/、configs/、tools/ 和 data/ 不在删除范围内。
+
+
+7. 重新交叉编译
+由于horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p/
+build_sparse4d_aarch64.sh不包含 `nash-m `，不需要改成 `nash-p `。它构建的是 AArch64 C++ 程序。
+
+在 J6P 工程目录执行：
+```bash
+cd "$UCP_ROOT/all-round-j6p"
+export LINARO_GCC_ROOT=/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-linux-gnu
+
+bash build_sparse4d_aarch64.sh
+file deploy/sparse4d/aarch64/bin/sparse4d_J6P
+```
+预期生成 deploy/sparse4d/aarch64/bin/sparse4d_J6P。该部署目录中的库来自 SDK 的 deps_aarch64。部署前应确认这套用户态库与你的 J6P BSP 和驱动兼容。
+
+8. 放入 J6P HBM、数据和配置,构建完整的部署包
+```bash
+cd "$UCP_ROOT/all-round-j6p"
+
+export PACKAGE_ROOT="$PWD/deploy/sparse4d/aarch64"
+export J6P_HBM=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/J6P_export/qat_export/model.hbm
+
+mkdir -p "$PACKAGE_ROOT/model" "$PACKAGE_ROOT/data" "$PACKAGE_ROOT/configs"
+
+cp "$J6P_HBM" "$PACKAGE_ROOT/model/model.hbm"
+cp configs/sparse4d/model_io.json "$PACKAGE_ROOT/configs/"
+cp -a data/sparse4d/demo_100frames "$PACKAGE_ROOT/data/"
+
+cd "$PACKAGE_ROOT"
+sha256sum model/model.hbm > model.sha256
+ls -lh bin/sparse4d_J6P model/model.hbm
+```
+此命令会在aarch64文件夹下产生configs、data、model等文件
+deploy/
+└── sparse4d/
+    └── aarch64/
+        ├── bin/                  # AArch64 可执行程序
+        ├── configs/              # 模型输入输出配置文件
+        ├── data/
+        │   └── demo_100frames/   # 100帧测试数据
+        ├── lib/                  # AArch64 动态链接库
+        ├── model/                # J6P HBM 模型
+        └── model.sha256          # HBM 模型 SHA-256 校验文件
+
+9. 打包部署包
+```bash
+cd "$UCP_ROOT/all-round-j6p/deploy/sparse4d"
+tar -czvf "$UCP_ROOT/all-round-j6p/aarch64.tar.gz" aarch64/
+```
+
+
+## 三、 板端执行
+1. 使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/J6P）。
+2. 解压aarch64.tar.gz
+```bash
+cd app/J6P
+tar -xzf aarch64.tar.gz
+```
+3. 板端执行100帧完整推理
+```bash
+cd /app/aarch64
+set -o pipefail
+
+bash bin/run_sparse4d.sh \
+  --model_file="$PWD/model/model.hbm" \
+  --model_name=forward \
+  --model_io="$PWD/configs/model_io.json" \
+  --manifest="$PWD/data/demo_100frames/manifest.json" \
+  --dump_dir="$PWD/output_j6p_100frames" \
+  --num_frames=-1 \
+  --warmup=0 \
+  --repeat=1 \
+  --save_outputs=true \
+  --visualize=true \
+  --visualize_score_threshold=0.5 \
+  --dump_inputs=false \
+  --trace=true \
+  2>&1 | tee run_j6p_100frames.log
+```
+这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
+
+成功时，并生成：
+aarch64/
+├── run_j6p_100frames.log
+└── output_j6p_100frames/
+    ├── 0/                            # 第一帧结果
+    ├── 1/
+    ├── …
+    └── 99/                           # 第100帧结果

@@ -1,0 +1,88 @@
+{
+  "inputs": [
+    {
+      "name": "_input_0",
+      "shape": [
+        4,
+        3,
+        256,
+        704
+      ],
+      "dtype": "s8"
+    },
+    {
+      "name": "_input_1",
+      "shape": [
+        1,
+        4,
+        4,
+        4
+      ],
+      "dtype": "s16"
+    },
+    {
+      "name": "_input_2",
+      "shape": [
+        1,
+        4,
+        3,
+        3
+      ],
+      "dtype": "s16"
+    },
+    {
+      "name": "_input_3",
+      "shape": [
+        1,
+        4,
+        1,
+        1,
+        4
+      ],
+      "dtype": "s16"
+    },
+    {
+      "name": "_input_4",
+      "shape": [
+        1,
+        4,
+        4,
+        4
+      ],
+      "dtype": "f32"
+    },
+    {
+      "name": "_input_5",
+      "shape": [
+        1,
+        2
+      ],
+      "dtype": "s16"
+    },
+    {
+      "name": "_input_6",
+      "shape": [],
+      "dtype": "f32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "_output_0",
+      "shape": [
+        1,
+        384,
+        13
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "_output_1",
+      "shape": [
+        1,
+        384,
+        8
+      ],
+      "dtype": "f16"
+    }
+  ]
+}

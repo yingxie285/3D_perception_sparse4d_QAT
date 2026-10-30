@@ -138,7 +138,7 @@ def parse_args():
     parser.add_argument("--expected-batch-size",type=int, default=1, help="部署图的batch size")
     parser.add_argument("--allow-nonstrict", action="store_true", help="允许QAT checkpoint存在missing/unexpected keys")
     parser.add_argument("--hbm-name", default="model.hbm", help="最终HBM文件名")
-    parser.add_argument("--march", default="nash-m", help="目标BPU架构")
+    parser.add_argument("--march", default="nash-m", choices=["nash-m", "nash-p"],help="目标BPU架构,用J6M还是J6P通过命令显式传入")
     parser.add_argument("--jobs", type=int, default=96, help="HBM编译线程数")
     parser.add_argument("--device", type=int, default=7, help="导出阶段使用的GPU编号")
     parser.add_argument("--opt", type=int, default=2, choices=[0, 1, 2], help="HBDK编译优化等级")
@@ -248,7 +248,7 @@ def _get_work_dir(cfg):
     )
 
 
-def _build_deploy_model(cfg, base_checkpoint):
+def _build_deploy_model(cfg, base_checkpoint,march):
     """Build FP32 model, load checkpoint, replace forward with horizon_forward."""
     model = build_module(cfg["model"])
 
@@ -257,7 +257,8 @@ def _build_deploy_model(cfg, base_checkpoint):
 
     model = model.cuda()
 
-    set_march("nash-m")  #xy1012 用nash-m，我们的域控是J6M
+    set_march(march)  #先用nash-m，我们的域控是J6M   #换成J6P
+    print("用到的march:", march)
 
     model.eval()
     replace_forward_with_horizon(model)  #这里把浮点的forward变成了horizon_forward
@@ -539,7 +540,7 @@ def run_calib_phase(args, cfg):
 
     data_loader = build_test_dataloader(cfg, distributed=False,)
 
-    deploy_model = _build_deploy_model(cfg,args.base_checkpoint) #用浮点的权重构建模型
+    deploy_model = _build_deploy_model(cfg, args.base_checkpoint, args.march) #用浮点的权重构建模型
 
     example_input = prepare_example_input(data_loader)  #不做时序的话直接构造1帧示例输入
     torch.save(example_input, EXAMPLE_INPUT_PT)
@@ -571,7 +572,7 @@ def run_QAT_test_phase(args, cfg):
 
     data_loader = build_test_dataloader(cfg, distributed=False,)
 
-    qat_model = _build_deploy_model(cfg,args.qat_checkpoint)
+    qat_model = _build_deploy_model(cfg, args.qat_checkpoint , args.march)
 
     qat_model.eval()
 
@@ -606,40 +607,6 @@ def _extract_qat_state_dict(checkpoint):
         )
     return state_dict
 
-#1021 不prepare，就可以正常导出hbm
-# @torch.no_grad()
-# def run_compile_phase(args, cfg):
-#     print("=" * 60)
-#     print("编译开始")
-#     print("=" * 60)
-
-#     os.makedirs(args.output_dir, exist_ok=True)
-#     set_march(args.march)
-
-#     base_checkpoint = args.base_checkpoint or cfg.get("load_from")
-#     deploy_model = _build_deploy_model(cfg, base_checkpoint)  #用浮点32位构建的horizon_forward的模型
-#     data_loader = build_test_dataloader(cfg, distributed=False)
-#     example_input = prepare_example_input(deploy_model, data_loader)
-    
-
-#     checkpoint = _load_torch_file(args.qat_checkpoint, "cpu")  #把已经训练好的 QAT checkpoint 加载到准备好的模型中
-    
-#     incompatible = deploy_model.load_state_dict(
-#         _extract_qat_state_dict(checkpoint), strict=False
-#     )
-#     missing = incompatible.missing_keys
-#     unexpected = incompatible.unexpected_keys
-#     print(f"[Export] state mismatch: missing={len(missing)}, unexpected={len(unexpected)}")
-#     if (missing or unexpected) and not args.allow_nonstrict:
-#         raise RuntimeError(
-#             "QAT checkpoint does not exactly match the prepared graph. "
-#             "Use --allow-nonstrict only after reviewing the mismatch."
-#         )
-
-#     hbm_path = horizon_export(deploy_model, example_input, args)
-#     print(f"[编译完成] HBM: {osp.abspath(hbm_path)}")
-
-
 # @torch.no_grad()
 def run_compile_phase(args, cfg):
     print("=" * 60)
@@ -650,11 +617,11 @@ def run_compile_phase(args, cfg):
     set_march(args.march)
 
     base_checkpoint = args.base_checkpoint or cfg.get("load_from")
-    deploy_model = _build_deploy_model(cfg, base_checkpoint)  #用浮点32位构建的horizon_forward的模型
+    deploy_model = _build_deploy_model(cfg, base_checkpoint, args.march)  #用浮点32位构建的horizon_forward的模型
     data_loader = build_test_dataloader(cfg, distributed=False)
     example_input = prepare_example_input(deploy_model, data_loader)
     
-    #要不要用qconfig来准备量化？
+    #要用qconfig来准备量化
     calib_model = prepare(
         deploy_model,
         example_input,
@@ -745,7 +712,7 @@ def run_train_phase(args, cfg):
     set_random_seed(cfg.get("seed", 0), deterministic=args.deterministic)
 
     ## Build Model
-    model = _build_deploy_model(cfg,args.base_checkpoint)   #换成horizon的forward
+    model = _build_deploy_model(cfg, args.base_checkpoint, args.march)   #换成horizon的forward
     calib_ckpt = os.path.join(CALIBRATION_CKPT)
     if os.path.exists(calib_ckpt):
         model.load_state_dict(torch.load(CALIBRATION_CKPT))

@@ -95,6 +95,7 @@ def parse_args():
     parser.add_argument(
         "--save_dir", default="/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1027", help="保存可视化图片的路径"
     )
+    parser.add_argument("--march", default="nash-m", choices=["nash-m", "nash-p"],help="目标BPU架构,用J6M还是J6P通过命令显式传入")
     parser.add_argument("--launcher", choices=["none", "pytorch"], default="none")
     parser.add_argument(
         "--deterministic",
@@ -118,7 +119,7 @@ def replace_forward_with_horizon(module):
     for child in module.children():
         replace_forward_with_horizon(child)
 
-def _build_deploy_model(cfg, base_checkpoint):
+def _build_deploy_model(cfg, base_checkpoint,march):
     """Build FP32 model, load checkpoint, replace forward with horizon_forward."""
     model = build_module(cfg["model"])
 
@@ -127,7 +128,8 @@ def _build_deploy_model(cfg, base_checkpoint):
 
     model = model.cuda()
 
-    set_march("nash-m")  #xy1012 用nash-m，我们的域控是J6M
+    set_march(march)  #先用nash-m，我们的域控是J6M   #换成J6P
+    print("用到的march:", march)
 
     model.eval()
     replace_forward_with_horizon(model)  #这里把浮点的forward变成了horizon_forward
@@ -239,7 +241,7 @@ def main():
         )
     ## Build Model
     # model = build_module(cfg["model"])
-    deploy_model = _build_deploy_model(cfg,args.base_checkpoint)
+    deploy_model = _build_deploy_model(cfg,args.base_checkpoint,args.march)
     # 1. 加载之前保存的单帧示例输入
     example_input_path = EXAMPLE_INPUT_PT
     print("example_input_path:",example_input_path)
