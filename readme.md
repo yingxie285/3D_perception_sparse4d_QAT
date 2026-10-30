@@ -469,7 +469,7 @@ bash bin/run_sparse4d.sh \
   --trace=true \
   2>&1 | tee run_j6p_100frames.log
 ```
-这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
+这里执行一次推理，没有预热。启动脚本设置了 nash-p 和包内运行库路径。
 
 成功时，并生成：
 ```text
