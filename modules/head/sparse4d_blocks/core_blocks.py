@@ -102,12 +102,20 @@ class DeformableAttentionAggr(BaseModule):
         # Keep camera geometry and feature fusion on independent observers.
         self.projection_matmul = Matmul()
         self.fusion_matmul = Matmul()
+        
+        #CPU2BPU
+        # Only quantize the camera-encoding branch.
+        # Do not replace the lidar2img tensor used by geometric projection.
+        self.camera_input_quant = QuantStub() if HORIZON_QAT else nn.Identity()
+
+        # Give the aggregation softmax a stable module name.
+        self.weights_softmax = nn.Softmax(dim=-2)
 
     def init_weight(self):
         constant_init(self.weights_fc, val=0.0, bias=0.0)
         xavier_init(self.output_proj, distribution="uniform", bias=0.0)
 
-    #xy0928 先得到投影点，再走else分支
+    #先得到投影点，再走else分支
     def forward(
         self,
         instance_feature: torch.Tensor,
@@ -362,30 +370,48 @@ class DeformableAttentionAggr(BaseModule):
         feature = instance_feature + anchor_embed
         if self.camera_encoder is not None:
             # 对相机的外参编码： (bs,6,4,4)=>(bs,6,256)
-            camera_embed = self.camera_encoder(
-                metas["lidar2img"][:, :, :3].reshape(bs, self.num_cams, -1)
-            )
             # camera_embed = self.camera_encoder(
-            #     torch.cat([metas["lidar2img"][:, :, :3].reshape(bs, self.num_cams, -1), 
-            #               metas["cam_distortion"].reshape(bs, self.num_cams, -1)], dim = -1)
-            # ) #[1, 4, 256]
-            # [bs, 900+x, 1, 256] + [bs, 1, 6, 256] => (bs, 900+x, 6, 256)
+            #     metas["lidar2img"][:, :, :3].reshape(bs, self.num_cams, -1)
+            # )
+            
+            #CPU2BPU camera_input_quant 为相机编码器建立独立量化入口，不直接改写几何投影使用的 lidar2img。
+            camera_input = metas["lidar2img"][:, :, :3].reshape(
+                bs, self.num_cams, -1
+            )
+            camera_input = self.camera_input_quant(camera_input)
+            camera_embed = self.camera_encoder(camera_input)
+            
             feature = feature[:, :, None] + camera_embed[:, None]
 
         # [] => [1, 1220, 6, 4, 13, 8]
-        weights = (
-            self.weights_fc(feature)  # (bs, 900+x, 6, 256)=>(bs, 900+x, 6, 416)
-            .reshape(bs, num_anchor, -1, self.num_groups)  # =>(bs, 900+x, 312, 8)
-            .softmax(dim=-2)
-            .reshape(
-                bs,
-                num_anchor,
-                self.num_cams,
-                self.num_levels,
-                self.num_pts,
-                self.num_groups,
-            )
+        # weights = (
+        #     self.weights_fc(feature)  # (bs, 900+x, 6, 256)=>(bs, 900+x, 6, 416)
+        #     .reshape(bs, num_anchor, -1, self.num_groups)  # =>(bs, 900+x, 312, 8)
+        #     .softmax(dim=-2)
+        #     .reshape(
+        #         bs,
+        #         num_anchor,
+        #         self.num_cams,
+        #         self.num_levels,
+        #         self.num_pts,
+        #         self.num_groups,
+        #     )
+        # )
+        
+        #CPU2BPU 显式 weights_softmax 保留原来的 dim=-2，计算语义不变，但能稳定指定量化配置。
+        weights = self.weights_fc(feature).reshape(
+            bs, num_anchor, -1, self.num_groups
         )
+        weights = self.weights_softmax(weights)
+        weights = weights.reshape(
+            bs,
+            num_anchor,
+            self.num_cams,
+            self.num_levels,
+            self.num_pts,
+            self.num_groups,
+        )
+        
         # self.attn_drop=0.15
         if self.training and self.attn_drop > 0:
             # [1, 1220, 6, 1, 13, 1]

@@ -94,20 +94,106 @@ def update_scale_by_qtype(model: torch.nn.Module):
             m.reset_dtype()
 
 
+# def get_qconfig_setter(model=None):
+#     """One shared qconfig definition for calibration and test_calib."""
+#     return QconfigSetter(
+#         get_qconfig(observer=observer_v2.HistogramObserver, fix_scale=False),
+#         templates=[
+#             ModuleNameTemplate({"": torch.float16}),
+#             ConvDtypeTemplate(input_dtype=qint16, weight_dtype=qint8),
+#             MatmulDtypeTemplate(input_dtypes=qint16),
+#             # Keep the previous backbone/FPN setting for this geometry repair.
+#             ConvDtypeTemplate(
+#                 input_dtype=qint8,
+#                 weight_dtype=qint8,
+#                 prefix=["img_backbone", "img_neck"],
+#             ),
+#             ModuleNameTemplate({
+#                 "head.cam_extrinsic_quant": qint16,
+#                 "head.cam_intrinsic_quant": qint16,
+#                 "head.cam_distortion_quant": qint16,
+#                 "head.metas_image_wh_quant": qint16,
+#             }),
+#         ],
+#     )
+
+#CPU2BPU  时延
 def get_qconfig_setter(model=None):
-    """One shared qconfig definition for calibration and test_calib."""
+    """Shared quantization definition for calibration and test_calib."""
+    if model is None:
+        raise ValueError("get_qconfig_setter requires the deploy model")
+
+    # Output settings for the camera-encoding branch.
+    branch_outputs = {}
+
+    # Explicit input/output settings for nonlinear operators.
+    nonlinear_io = {}
+
+    def int16_io():
+        return {"input": qint16, "output": qint16}
+
+    for name, module in model.named_modules():
+        if not name.startswith("head."):
+            continue
+
+        # Cover LayerNorm modules actually present in this model.
+        if isinstance(module, torch.nn.LayerNorm):
+            nonlinear_io[name] = int16_io()
+
+        # Includes the explicitly named weights_softmax added above.
+        if isinstance(module, torch.nn.Softmax):
+            nonlinear_io[name] = int16_io()
+
+        if (
+            hasattr(module, "camera_encoder")
+            and module.camera_encoder is not None
+        ):
+            branch_outputs[f"{name}.camera_encoder"] = qint16
+            branch_outputs[f"{name}.camera_input_quant"] = qint16
+            branch_outputs[f"{name}.weights_fc"] = qint16
+
+        # Existing compiled advice identifies the decomposed attention
+        # softmax as head.layers.<index>.attn.softmax.
+        if isinstance(module, torch.nn.MultiheadAttention):
+            nonlinear_io[f"{name}.softmax"] = int16_io()
+
+        # Existing advice identifies anchor-size exp under this name.
+        # Confirm its name and final dtype in the new prepare/advice files.
+        if name.endswith(".kps_generator"):
+            nonlinear_io[f"{name}._generated_exp_0"] = int16_io()
+
+    print("[QConfig] INT16 camera branches:")
+    for name in sorted(branch_outputs):
+        print(" ", name)
+
+    print("[QConfig] INT16 nonlinear input/output targets:")
+    for name in sorted(nonlinear_io):
+        print(" ", name)
+
     return QconfigSetter(
-        get_qconfig(observer=observer_v2.HistogramObserver, fix_scale=False),
+        get_qconfig(
+            observer=observer_v2.HistogramObserver,
+            fix_scale=False,
+        ),
         templates=[
             ModuleNameTemplate({"": torch.float16}),
-            ConvDtypeTemplate(input_dtype=qint16, weight_dtype=qint8),
+
+            ModuleNameTemplate(branch_outputs),
+
+            ConvDtypeTemplate(
+                input_dtype=qint16,
+                weight_dtype=qint8,
+            ),
             MatmulDtypeTemplate(input_dtypes=qint16),
-            # Keep the previous backbone/FPN setting for this geometry repair.
+
             ConvDtypeTemplate(
                 input_dtype=qint8,
                 weight_dtype=qint8,
                 prefix=["img_backbone", "img_neck"],
             ),
+
+            ModuleNameTemplate(nonlinear_io),
+
             ModuleNameTemplate({
                 "head.cam_extrinsic_quant": qint16,
                 "head.cam_intrinsic_quant": qint16,
@@ -115,6 +201,9 @@ def get_qconfig_setter(model=None):
                 "head.metas_image_wh_quant": qint16,
             }),
         ],
+        save_dir=osp.join(
+            WORK_DIR, PREFIEX, "qconfig_setting"
+        ),
     )
 
 #定义参数

@@ -23,19 +23,6 @@ from horizon_plugin_pytorch.quantization import (
     set_fake_quantize,
     FakeQuantState,
 )
-from horizon_plugin_pytorch.quantization.qconfig_setter import (
-    QconfigSetter,
-    ModuleNameTemplate,
-    ConvDtypeTemplate,
-    MatmulDtypeTemplate,
-)
-import horizon_plugin_pytorch.quantization.observer as observer
-from horizon_plugin_pytorch.quantization.fake_quantize import FakeQuantize
-import horizon_plugin_pytorch.quantization.observer_v2 as observer_v2
-from horizon_plugin_pytorch.dtype import qint8, qint16
-from horizon_plugin_pytorch.quantization import get_qconfig
-from horizon_plugin_pytorch.quantization.hbdk4 import export
-from hbdk4.compiler import compile, convert, hbm_perf, save
 
 # SparseEnd2End native imports, replacing only the MMDet-specific model/data
 # construction used by the original SparseDrive QAT script.

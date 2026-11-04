@@ -338,7 +338,7 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
             temp_key_points_list.append(temp_key_points) #每个历史帧的关键点形状为 [bs, num_anchor, 13, 3]，表示补偿运动后的全局3D坐标
         return key_points, temp_key_points_list
 
-#-----------------------------------加quant--------------------------------------
+#-------------加quant----消除 25 条 CPU ScatterND----------
     def horizon_forward(
         self,
         anchor,
@@ -360,24 +360,37 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
                 [key_points, learnable_scale * size], dim=-2  # 拼接基础+动态关键点
             )  # (bs, num_query, 7+6, 3)
 
-        rotation_mat = anchor.new_zeros([bs, num_anchor, 3, 3])
+        # rotation_mat = anchor.new_zeros([bs, num_anchor, 3, 3])
 
-        rotation_mat[:, :, 0, 0] = anchor[:, :, COS_YAW]
-        rotation_mat[:, :, 0, 1] = -anchor[:, :, SIN_YAW]
-        rotation_mat[:, :, 1, 0] = anchor[:, :, SIN_YAW]
-        rotation_mat[:, :, 1, 1] = anchor[:, :, COS_YAW]
-        rotation_mat[:, :, 2, 2] = 1
+        # rotation_mat[:, :, 0, 0] = anchor[:, :, COS_YAW]
+        # rotation_mat[:, :, 0, 1] = -anchor[:, :, SIN_YAW]
+        # rotation_mat[:, :, 1, 0] = anchor[:, :, SIN_YAW]
+        # rotation_mat[:, :, 1, 1] = anchor[:, :, COS_YAW]
+        # rotation_mat[:, :, 2, 2] = 1
+        
+        #CPU2BPU 新写法直接构造相同矩阵，避免rotation_mat索引写入
+        cos_yaw = anchor[:, :, COS_YAW]
+        sin_yaw = anchor[:, :, SIN_YAW]
+        zeros = torch.zeros_like(cos_yaw)
+        ones = torch.ones_like(cos_yaw)
+
+        rotation_mat = torch.stack(
+            (
+                torch.stack((cos_yaw, -sin_yaw, zeros), dim=-1),
+                torch.stack((sin_yaw, cos_yaw, zeros), dim=-1),
+                torch.stack((zeros, zeros, ones), dim=-1),
+            ),
+            dim=-2,
+        )
 
         # [bs, num_query, 1, 3, 3] @ [bs, num_query, 6+7, 3, 1] => [bs,num_query,6+7,3, 1]
         # key_points = torch.matmul(rotation_mat[:, :, None], key_points[..., None]).squeeze(-1)
-        key_points = torch.matmul(rotation_mat[:, :, None], key_points[..., None])[
-            ..., 0
-        ]  # deploy friendly
+        key_points = torch.matmul(rotation_mat[:, :, None], key_points[..., None])[..., 0]  # deploy friendly
 
         # [bs,num_query,6+7,3] + [bs, num_query, 1, 3]
         # key_points = key_points + anchor[..., None, [X, Y, Z]]
         key_points = key_points + anchor[..., None, :3]  # deploy friendly 关键点现在表示全局3D坐标 [bs, 900+x, 13, 3]。
-        return key_points  # 不用下面的时序，直接return出去
+        return key_points  # 不用forward的时序，直接return出去
 #-----------------------------------------------------------------------------
 
     @staticmethod
