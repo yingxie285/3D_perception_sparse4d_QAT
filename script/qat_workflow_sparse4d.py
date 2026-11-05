@@ -170,6 +170,56 @@ def get_qconfig_setter(model=None):
     for name in sorted(nonlinear_io):
         print(" ", name)
 
+    #----分组INT8，保留几何和归一化精度----
+    # Optional, cumulative performance experiments. Keep "base" reproducible.
+    perf_mode = os.environ.get("SPARSE4D_PERF_MODE", "base")
+    if perf_mode not in {"base", "linear8", "qk8", "fusion8"}:
+        raise ValueError(f"Unknown SPARSE4D_PERF_MODE: {perf_mode}")
+
+    linear_prefixes = ["head.fc_before", "head.fc_after"]
+    qk_prefixes = []
+    fusion_prefixes = []
+    for i, op in enumerate(model.head.operation_order):
+        prefix = f"head.layers.{i}"
+        if op == "ffn":
+            linear_prefixes.extend([
+                f"{prefix}.layers",
+                f"{prefix}.identity_fc",
+            ])
+        elif op == "gnn":
+            linear_prefixes.append(f"{prefix}.attn")
+            # Existing advice identifies QK as .matmul and AV as .attn_matmul.
+            qk_prefixes.append(f"{prefix}.attn.matmul")
+        elif op == "deformable":
+            fusion_prefixes.append(f"{prefix}.fusion_matmul")
+
+    perf_templates = []
+    if perf_mode in {"linear8", "qk8", "fusion8"}:
+        perf_templates.append(ConvDtypeTemplate(
+            input_dtype=qint8,
+            weight_dtype=qint8,
+            prefix=linear_prefixes,
+        ))
+    if perf_mode in {"qk8", "fusion8"}:
+        perf_templates.append(MatmulDtypeTemplate(
+            input_dtypes=(qint8, qint8),
+            prefix=qk_prefixes,
+        ))
+    if perf_mode == "fusion8":
+        # In horizon_multi_view_level_fusion:
+        # input 0 = weights, input 1 = sampled features.
+        perf_templates.append(MatmulDtypeTemplate(
+            input_dtypes=(qint16, qint8),
+            prefix=fusion_prefixes,
+        ))
+
+    print("[PerfQConfig]", perf_mode)
+    print("  Linear prefixes:", linear_prefixes)
+    print("  QK prefixes:", qk_prefixes)
+    print("  Fusion prefixes:", fusion_prefixes)
+    #----分组INT8，保留几何和归一化精度----
+    
+        
     return QconfigSetter(
         get_qconfig(
             observer=observer_v2.HistogramObserver,
@@ -191,7 +241,7 @@ def get_qconfig_setter(model=None):
                 weight_dtype=qint8,
                 prefix=["img_backbone", "img_neck"],
             ),
-
+            *perf_templates,  #分组INT8，保留几何和归一化精度
             ModuleNameTemplate(nonlinear_io),
 
             ModuleNameTemplate({

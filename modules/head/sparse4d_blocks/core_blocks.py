@@ -527,7 +527,7 @@ class DeformableAttentionAggr(BaseModule):
 
         return key_points2d
 
-    @staticmethod  #xy0928
+    @staticmethod  #浮点的else分支调用的特征采样函数
     def feature_sampling(
         feature_maps: List[torch.Tensor],
         points_2d: torch.Tensor,
@@ -823,17 +823,42 @@ class DeformableAttentionAggr(BaseModule):
         ]
         points_2d_fp32 = points_2d.float()
         weights_fp32 = weights.float()
-        features = self.feature_sampling_horizon(
+        # features = self.feature_sampling_horizon(
+        #     feature_maps_fp32,
+        #     points_2d_fp32,
+        # )
+        
+        #----独立方案：将有效点掩码从特征移到注意力权重---------
+        features, valid_mask = self.feature_sampling_horizon(
             feature_maps_fp32,
             points_2d_fp32,
         )
+        # Apply the SAME mask after softmax. Do not normalize again.
+        print("==========DEBUG ==========")
 
+        print("weights type:", type(weights))
+        print("weights dtype:", weights.dtype)
+
+        print("weights_fp32 type:", type(weights_fp32))
+        print("weights_fp32 dtype:", weights_fp32.dtype)
+
+        print("valid_mask type:", type(valid_mask))
+        print("valid_mask dtype:", valid_mask.dtype)
+
+        print("features type:", type(features))
+        print("features dtype:", features.dtype)
+
+        print("================================")
+        mask_float = valid_mask.to(torch.float32)
+        weights_masked = weights * mask_float
+        #-----独立方案：将有效点掩码从特征移到注意力权重---------
+        
         # =========================================================
         # 5. Camera + level fusion
         # =========================================================
         features = self.horizon_multi_view_level_fusion(
             features,
-            weights_fp32,
+            weights_masked,  #用掩码后的权重
         )
 
         # =========================================================
@@ -950,7 +975,7 @@ class DeformableAttentionAggr(BaseModule):
             uv = uv / wh
         return uv
 
-#---------------------------------------0930-------------------------------------
+#------------部署版本的特征采样函数----------------------------
     @staticmethod
     def feature_sampling_horizon(
         feature_maps: List[torch.Tensor],
@@ -1040,10 +1065,7 @@ class DeformableAttentionAggr(BaseModule):
 
 
         # =========================================================
-        # 5. 非法投影点直接置0
-        #
-        # 这个非常重要
-        # =========================================================
+        # 4. 非法投影点直接置0 这个非常重要
 
         # [B, Cams, N, P]
         #
@@ -1056,15 +1078,20 @@ class DeformableAttentionAggr(BaseModule):
             3,
         ).unsqueeze(3).unsqueeze(-1)
 
-        features = features * valid_mask.to(
-            dtype=features.dtype
-        )
-        # print("features.shape =", features.shape)
-        # print("valid ratio =", valid_mask.float().mean())
-        # print("features abs mean =", features.abs().mean())
-        # print("features abs max =", features.abs().max())
+        # features = features * valid_mask.to(
+        #     dtype=features.dtype
+        # )
+        # # print("features.shape =", features.shape)
+        # # print("valid ratio =", valid_mask.float().mean())
+        # # print("features abs mean =", features.abs().mean())
+        # # print("features abs max =", features.abs().max())
 
-        return features
+        # return features
+        
+        #独立方案：将有效点掩码从特征移到注意力权重
+        # [B, N, Cams, 1, P, 1], shared across levels and feature groups.
+        # The caller masks attention weights instead of the large feature tensor.
+        return features, valid_mask
 #-----------------------------------------------------------------------------
 
 class DenseDepthNet(BaseModule):

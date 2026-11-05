@@ -20,6 +20,8 @@ namespace fs = sparse4d::files;
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <array>  //C++前处理四相机并行
+#include <future> //C++前处理四相机并行
 
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
@@ -94,6 +96,8 @@ DEFINE_int32(repeat, 1, "Measured iterations per frame");
 DEFINE_int32(top_k, 300, "Global detection top-k");
 DEFINE_double(score_threshold, 0.0, "Saved detection threshold");
 DEFINE_double(visualize_score_threshold, 0.5, "Display threshold only");
+DEFINE_int32(preprocess_workers, 4,
+             "Concurrent camera preprocessing workers, 1..4"); // C++前处理四相机并行
 static Options options(const std::string &frame, const std::string &output)
 {
     Options o;
@@ -163,6 +167,8 @@ static void append(std::vector<float> &dst, const double *src, size_t n)
     for (size_t i = 0; i < n; ++i)
         dst.push_back(float(src[i]));
 }
+
+// C++前处理四相机并行
 static Frame preprocess(const fs::path &path)
 {
     Frame f;
@@ -173,18 +179,24 @@ static Frame preprocess(const fs::path &path)
     const auto &p = j.at("preprocess");
     require(!p.value("flip", false) && p.value("rotate", 0.) == 0.,
             "Only deterministic test augmentation supported.");
-    double resize = p.at("resize").get<double>();
-    auto crop = p.at("crop").get<std::vector<int>>();
-    require(crop.size() == 4 && crop[2] - crop[0] == 704 && crop[3] - crop[1] == 256, "Expected 704x256 crop.");
-    require(std::isfinite(resize) && resize > 0 && resize <= 10, "Invalid resize.");
-    auto mean = numbers<3>(p.at("mean")), stddev = numbers<3>(p.at("std"));
-    // Python stores config mean/std as float32 before promoting them for OpenCV.
+
+    const double resize = p.at("resize").get<double>();
+    const auto crop = p.at("crop").get<std::vector<int>>();
+    require(crop.size() == 4 && crop[2] - crop[0] == 704 &&
+                crop[3] - crop[1] == 256,
+            "Expected 704x256 crop.");
+    require(std::isfinite(resize) && resize > 0 && resize <= 10,
+            "Invalid resize.");
+
+    auto mean = numbers<3>(p.at("mean"));
+    auto stddev = numbers<3>(p.at("std"));
     for (double &v : mean)
         v = double(float(v));
     for (double &v : stddev)
         v = double(float(v));
     for (double v : stddev)
         require(v > 0, "Normalization std must be positive.");
+
     f.inputs["img"].shape = {1, 4, 3, 256, 704};
     f.inputs["cam_extrinsic"].shape = {1, 4, 4, 4};
     f.inputs["cam_intrinsic"].shape = {1, 4, 3, 3};
@@ -192,37 +204,32 @@ static Frame preprocess(const fs::path &path)
     f.inputs["lidar2img"].shape = {1, 4, 4, 4};
     f.inputs["image_wh"] = {{1, 2}, {256.f, 704.f}};
     f.inputs["time_interval"] = {{1}, {float(j.value("time_interval", 1.0))}};
-    require(f.inputs["time_interval"].data[0] == 1.f, "Non-temporal export requires time_interval=1.");
+    require(f.inputs["time_interval"].data[0] == 1.f,
+            "Non-temporal export requires time_interval=1.");
 
-    // 在相机循环前增加查表与预分配 Build the same two-stage normalization with the existing OpenCV
-    //  arithmetic, once for all possible uint8 pixel values.
     cv::Mat norm_table(1, 256, CV_32FC3);
     for (int v = 0; v < 256; ++v)
-    {
         norm_table.at<cv::Vec3f>(0, v) =
             cv::Vec3f(float(v), float(v), float(v));
-    }
-    cv::subtract(
-        norm_table,
-        cv::Scalar(mean[0], mean[1], mean[2]),
-        norm_table);
-    cv::multiply(
-        norm_table,
-        cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]),
-        norm_table);
+    cv::subtract(norm_table, cv::Scalar(mean[0], mean[1], mean[2]),
+                 norm_table);
+    cv::multiply(norm_table,
+                 cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]),
+                 norm_table);
 
     const auto *lut = norm_table.ptr<cv::Vec3f>(0);
     const bool to_rgb = p.value("to_rgb", true);
     constexpr size_t plane_size = size_t(256) * 704;
-
     auto &img = f.inputs["img"].data;
     img.resize(size_t(4) * 3 * plane_size);
-    f.cameras.reserve(4); // 在相机循环前增加查表与预分配
+    f.cameras.resize(4);
 
+    // Prepare all containers before starting worker threads.
     std::set<std::string> seen;
-    for (const auto &cj : j.at("cameras"))
+    for (size_t i = 0; i < 4; ++i)
     {
-        Camera c;
+        const auto &cj = j.at("cameras").at(i);
+        auto &c = f.cameras[i];
         c.name = cj.at("name").get<std::string>();
         require(seen.insert(c.name).second, "Duplicate camera name.");
         c.path = fs::path(cj.at("image").get<std::string>());
@@ -232,52 +239,36 @@ static Frame preprocess(const fs::path &path)
         c.e = numbers<16>(cj.at("cam_extrinsic"));
         c.distortion = numbers<4>(cj.at("cam_distortion"));
         c.lidar2img = numbers<16>(cj.at("lidar2img"));
+    }
+
+    auto process_camera = [&](size_t i)
+    {
+        std::fesetround(FE_TONEAREST);
+        auto &c = f.cameras[i];
         c.image = cv::imread(c.path.string(), cv::IMREAD_COLOR);
         require(!c.image.empty(), "Cannot load " + c.path.string());
-        if (!f.cameras.empty())
-            require(c.image.size() == f.cameras[0].image.size(), "Camera dimensions differ.");
-        int rw = int(c.image.cols * resize), rh = int(c.image.rows * resize);
+        const int rw = int(c.image.cols * resize);
+        const int rh = int(c.image.rows * resize);
         require(rw > 0 && rh > 0, "Empty resize.");
-        std::cout << "camera[" << f.cameras.size() << "] " << c.name << " " << c.image.cols << "x" << c.image.rows
-                  << " -> " << rw << "x" << rh << " -> crop " << crop[0] << "," << crop[1] << ",704,256\n";
-        cv::Mat resized, patch = cv::Mat::zeros(256, 704, CV_8UC3);
-        // _img_transform recomputes dsize from actual image dimensions.
-        cv::resize(c.image, resized, cv::Size(rw, rh), 0, 0, cv::INTER_LINEAR);
-        cv::Rect region(crop[0], crop[1], 704, 256), available(0, 0, rw, rh);
-        cv::Rect intersection = region & available;
-        // PIL.crop fills out-of-bounds pixels with zero.
+
+        cv::Mat resized;
+        cv::resize(c.image, resized, cv::Size(rw, rh),
+                   0, 0, cv::INTER_LINEAR);
+        cv::Mat patch = cv::Mat::zeros(256, 704, CV_8UC3);
+        const cv::Rect region(crop[0], crop[1], 704, 256);
+        const cv::Rect intersection = region & cv::Rect(0, 0, rw, rh);
         if (intersection.area() > 0)
             resized(intersection).copyTo(patch(cv::Rect(intersection.x - region.x, intersection.y - region.y, intersection.width, intersection.height)));
-        // cv::Mat normalized;
-        // patch.convertTo(normalized, CV_32FC3);
-        // if (p.value("to_rgb", true))
-        //     cv::cvtColor(normalized, normalized, cv::COLOR_BGR2RGB);
-        // cv::subtract(normalized, cv::Scalar(mean[0], mean[1], mean[2]), normalized);
-        // cv::multiply(normalized, cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]), normalized);
-        // auto &img = f.inputs["img"].data;
-        // for (int ch = 0; ch < 3; ++ch)
-        //     for (int y = 0; y < 256; ++y)
-        //     {
-        //         const auto *row = normalized.ptr<cv::Vec3f>(y);
-        //         for (int x = 0; x < 704; ++x)
-        //             img.push_back(row[x][ch]);
-        //     }
 
-        // 替换归一化及 push_back 部分
-        const size_t camera_index = f.cameras.size();
-
-        float *dst0 = img.data() + camera_index * 3 * plane_size;
+        float *dst0 = img.data() + i * 3 * plane_size;
         float *dst1 = dst0 + plane_size;
         float *dst2 = dst1 + plane_size;
-
         const int src0 = to_rgb ? 2 : 0;
         const int src2 = to_rgb ? 0 : 2;
-
         for (int y = 0; y < 256; ++y)
         {
             const auto *row = patch.ptr<cv::Vec3b>(y);
             const size_t offset = size_t(y) * 704;
-
             for (int x = 0; x < 704; ++x)
             {
                 const auto pixel = row[x];
@@ -285,11 +276,50 @@ static Frame preprocess(const fs::path &path)
                 dst1[offset + x] = lut[pixel[1]][1];
                 dst2[offset + x] = lut[pixel[src2]][2];
             }
-        } // 一次性分配图像 Tensor，避免逐元素 push_back 的容量检查和扩容。
+        }
+    };
+
+    const int workers = FLAGS_preprocess_workers;
+    if (workers == 1)
+    {
+        for (size_t i = 0; i < 4; ++i)
+            process_camera(i);
+    }
+    else
+    {
+        std::vector<std::future<void>> jobs;
+        jobs.reserve(workers);
+        for (int worker = 0; worker < workers; ++worker)
+        {
+            jobs.emplace_back(std::async(
+                std::launch::async,
+                [&, worker]
+                {
+                    for (size_t i = size_t(worker); i < 4;
+                         i += size_t(workers))
+                        process_camera(i);
+                }));
+        }
+        for (auto &job : jobs)
+            job.get();
+    }
+
+    // Append metadata only after workers have completed, in camera order.
+    for (size_t i = 0; i < 4; ++i)
+    {
+        const auto &c = f.cameras[i];
+        require(c.image.size() == f.cameras[0].image.size(),
+                "Camera dimensions differ.");
+        if (FLAGS_trace)
+            std::cout << "camera[" << i << "] " << c.name << " "
+                      << c.image.cols << "x" << c.image.rows
+                      << " -> " << int(c.image.cols * resize)
+                      << "x" << int(c.image.rows * resize)
+                      << " -> crop " << crop[0] << "," << crop[1]
+                      << ",704,256\n";
 
         append(f.inputs["cam_extrinsic"].data, c.e.data(), 16);
         auto inference_k = c.k;
-        // Exact repo behavior: scale entire 3x3 including K[2,2]; no crop subtraction in K.
         for (auto &v : inference_k)
             v *= resize;
         append(f.inputs["cam_intrinsic"].data, inference_k.data(), 9);
@@ -301,11 +331,154 @@ static Frame preprocess(const fs::path &path)
             l2i[4 + col] = resize * c.lidar2img[4 + col] - crop[1] * c.lidar2img[8 + col];
         }
         append(f.inputs["lidar2img"].data, l2i.data(), 16);
-        // image_wh is one [H,W] pair per batch, NOT one pair per camera.
-        f.cameras.push_back(std::move(c));
     }
     return f;
 }
+
+// 下面是原先的preprocess
+// static Frame preprocess(const fs::path &path)
+// {
+//     Frame f;
+//     f.manifest = read_json(path);
+//     const auto &j = f.manifest;
+//     require(j.at("schema_version") == 1, "Unsupported manifest schema.");
+//     require(j.at("cameras").size() == 4, "Exactly four cameras required.");
+//     const auto &p = j.at("preprocess");
+//     require(!p.value("flip", false) && p.value("rotate", 0.) == 0.,
+//             "Only deterministic test augmentation supported.");
+//     double resize = p.at("resize").get<double>();
+//     auto crop = p.at("crop").get<std::vector<int>>();
+//     require(crop.size() == 4 && crop[2] - crop[0] == 704 && crop[3] - crop[1] == 256, "Expected 704x256 crop.");
+//     require(std::isfinite(resize) && resize > 0 && resize <= 10, "Invalid resize.");
+//     auto mean = numbers<3>(p.at("mean")), stddev = numbers<3>(p.at("std"));
+//     // Python stores config mean/std as float32 before promoting them for OpenCV.
+//     for (double &v : mean)
+//         v = double(float(v));
+//     for (double &v : stddev)
+//         v = double(float(v));
+//     for (double v : stddev)
+//         require(v > 0, "Normalization std must be positive.");
+//     f.inputs["img"].shape = {1, 4, 3, 256, 704};
+//     f.inputs["cam_extrinsic"].shape = {1, 4, 4, 4};
+//     f.inputs["cam_intrinsic"].shape = {1, 4, 3, 3};
+//     f.inputs["cam_distortion"].shape = {1, 4, 4};
+//     f.inputs["lidar2img"].shape = {1, 4, 4, 4};
+//     f.inputs["image_wh"] = {{1, 2}, {256.f, 704.f}};
+//     f.inputs["time_interval"] = {{1}, {float(j.value("time_interval", 1.0))}};
+//     require(f.inputs["time_interval"].data[0] == 1.f, "Non-temporal export requires time_interval=1.");
+
+//     // 在相机循环前增加查表与预分配 Build the same two-stage normalization with the existing OpenCV
+//     //  arithmetic, once for all possible uint8 pixel values.
+//     cv::Mat norm_table(1, 256, CV_32FC3);
+//     for (int v = 0; v < 256; ++v)
+//     {
+//         norm_table.at<cv::Vec3f>(0, v) =
+//             cv::Vec3f(float(v), float(v), float(v));
+//     }
+//     cv::subtract(
+//         norm_table,
+//         cv::Scalar(mean[0], mean[1], mean[2]),
+//         norm_table);
+//     cv::multiply(
+//         norm_table,
+//         cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]),
+//         norm_table);
+
+//     const auto *lut = norm_table.ptr<cv::Vec3f>(0);
+//     const bool to_rgb = p.value("to_rgb", true);
+//     constexpr size_t plane_size = size_t(256) * 704;
+
+//     auto &img = f.inputs["img"].data;
+//     img.resize(size_t(4) * 3 * plane_size);
+//     f.cameras.reserve(4); // 在相机循环前增加查表与预分配
+
+//     std::set<std::string> seen;
+//     for (const auto &cj : j.at("cameras"))
+//     {
+//         Camera c;
+//         c.name = cj.at("name").get<std::string>();
+//         require(seen.insert(c.name).second, "Duplicate camera name.");
+//         c.path = fs::path(cj.at("image").get<std::string>());
+//         if (c.path.is_relative())
+//             c.path = path.parent_path() / c.path;
+//         c.k = numbers<9>(cj.at("cam_intrinsic"));
+//         c.e = numbers<16>(cj.at("cam_extrinsic"));
+//         c.distortion = numbers<4>(cj.at("cam_distortion"));
+//         c.lidar2img = numbers<16>(cj.at("lidar2img"));
+//         c.image = cv::imread(c.path.string(), cv::IMREAD_COLOR);
+//         require(!c.image.empty(), "Cannot load " + c.path.string());
+//         if (!f.cameras.empty())
+//             require(c.image.size() == f.cameras[0].image.size(), "Camera dimensions differ.");
+//         int rw = int(c.image.cols * resize), rh = int(c.image.rows * resize);
+//         require(rw > 0 && rh > 0, "Empty resize.");
+//         std::cout << "camera[" << f.cameras.size() << "] " << c.name << " " << c.image.cols << "x" << c.image.rows
+//                   << " -> " << rw << "x" << rh << " -> crop " << crop[0] << "," << crop[1] << ",704,256\n";
+//         cv::Mat resized, patch = cv::Mat::zeros(256, 704, CV_8UC3);
+//         // _img_transform recomputes dsize from actual image dimensions.
+//         cv::resize(c.image, resized, cv::Size(rw, rh), 0, 0, cv::INTER_LINEAR);
+//         cv::Rect region(crop[0], crop[1], 704, 256), available(0, 0, rw, rh);
+//         cv::Rect intersection = region & available;
+//         // PIL.crop fills out-of-bounds pixels with zero.
+//         if (intersection.area() > 0)
+//             resized(intersection).copyTo(patch(cv::Rect(intersection.x - region.x, intersection.y - region.y, intersection.width, intersection.height)));
+//         // cv::Mat normalized;
+//         // patch.convertTo(normalized, CV_32FC3);
+//         // if (p.value("to_rgb", true))
+//         //     cv::cvtColor(normalized, normalized, cv::COLOR_BGR2RGB);
+//         // cv::subtract(normalized, cv::Scalar(mean[0], mean[1], mean[2]), normalized);
+//         // cv::multiply(normalized, cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]), normalized);
+//         // auto &img = f.inputs["img"].data;
+//         // for (int ch = 0; ch < 3; ++ch)
+//         //     for (int y = 0; y < 256; ++y)
+//         //     {
+//         //         const auto *row = normalized.ptr<cv::Vec3f>(y);
+//         //         for (int x = 0; x < 704; ++x)
+//         //             img.push_back(row[x][ch]);
+//         //     }
+
+//         // 替换归一化及 push_back 部分
+//         const size_t camera_index = f.cameras.size();
+
+//         float *dst0 = img.data() + camera_index * 3 * plane_size;
+//         float *dst1 = dst0 + plane_size;
+//         float *dst2 = dst1 + plane_size;
+
+//         const int src0 = to_rgb ? 2 : 0;
+//         const int src2 = to_rgb ? 0 : 2;
+
+//         for (int y = 0; y < 256; ++y)
+//         {
+//             const auto *row = patch.ptr<cv::Vec3b>(y);
+//             const size_t offset = size_t(y) * 704;
+
+//             for (int x = 0; x < 704; ++x)
+//             {
+//                 const auto pixel = row[x];
+//                 dst0[offset + x] = lut[pixel[src0]][0];
+//                 dst1[offset + x] = lut[pixel[1]][1];
+//                 dst2[offset + x] = lut[pixel[src2]][2];
+//             }
+//         } // 一次性分配图像 Tensor，避免逐元素 push_back 的容量检查和扩容。
+
+//         append(f.inputs["cam_extrinsic"].data, c.e.data(), 16);
+//         auto inference_k = c.k;
+//         // Exact repo behavior: scale entire 3x3 including K[2,2]; no crop subtraction in K.
+//         for (auto &v : inference_k)
+//             v *= resize;
+//         append(f.inputs["cam_intrinsic"].data, inference_k.data(), 9);
+//         append(f.inputs["cam_distortion"].data, c.distortion.data(), 4);
+//         auto l2i = c.lidar2img;
+//         for (int col = 0; col < 4; ++col)
+//         {
+//             l2i[col] = resize * c.lidar2img[col] - crop[0] * c.lidar2img[8 + col];
+//             l2i[4 + col] = resize * c.lidar2img[4 + col] - crop[1] * c.lidar2img[8 + col];
+//         }
+//         append(f.inputs["lidar2img"].data, l2i.data(), 16);
+//         // image_wh is one [H,W] pair per batch, NOT one pair per camera.
+//         f.cameras.push_back(std::move(c));
+//     }
+//     return f;
+// }
 static void dump_floats(const fs::path &path, const std::vector<float> &data)
 {
     std::ofstream out(path.string(), std::ios::binary);
@@ -667,6 +840,8 @@ static int run_frame(const Options &o, Model &m)
             auto t = Clock::now();
             f = preprocess(o.frame);
             timing["load_images_and_preprocess_ms"] = ms(t);
+            timing["preprocess_workers"] = FLAGS_preprocess_workers; // C++前处理四相机并行
+            timing["opencv_threads"] = cv::getNumThreads();          // C++前处理四相机并行
             if (o.dump || o.preprocess_only)
                 dump_inputs(f, o.out / "inputs");
             if (o.preprocess_only)
@@ -819,6 +994,14 @@ int Sparse4DMain(int argc, char **argv)
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try
     {
+        // C++前处理四相机并行
+        require(FLAGS_preprocess_workers >= 1 &&
+                    FLAGS_preprocess_workers <= 4,
+                "preprocess_workers must be in [1, 4]");
+        // Set once in the main thread, not inside camera workers.
+        cv::setNumThreads(1);
+        std::cout << "preprocess_workers=" << FLAGS_preprocess_workers
+                  << " opencv_threads=" << cv::getNumThreads() << "\n"; // C++前处理四相机并行
         Model model;
         if (FLAGS_inspect_only)
             return run_frame(options("", FLAGS_dump_dir), model);

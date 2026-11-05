@@ -169,9 +169,9 @@ python3 tools/sparse4d/export_demo.py \
 为避免文件丢失，使用zip把demo_100frames文件夹压缩后，再拖动到板端，并解压zip。
 
 
-# J6部署-板端
+## 五、J6部署-交叉编译
 在服务器里进行交叉编译，以生成板端能运行的产物。
-## 1. 服务器设置路径
+### 1. 服务器设置路径
 确保本地最新的 all-round 已上传到服务器，然后执行：
 ```bash
 export SDK_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326
@@ -180,7 +180,7 @@ export SAMPLE_ROOT="$SDK_ROOT/samples/ucp_tutorial/all-round"
 cd "$SAMPLE_ROOT"
 ```
 
-## 2. 检查交叉编译器
+### 2. 检查交叉编译器
 下面是参考工程使用的默认路径。如果实际安装位置不同，只修改这一行：
 ```bash
 export LINARO_GCC_ROOT=/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-linux-gnu
@@ -196,7 +196,7 @@ find /opt /usr/local /home /data1 / \
   -maxdepth 5 -name aarch64-none-linux-gnu-g++ 2>/dev/null
 ```
 
-## 3. 检查依赖并编译
+### 3. 检查依赖并编译
 ```bash
 ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/ucp/lib"
 ls "$SDK_ROOT/samples/ucp_tutorial/deps_aarch64/opencv/lib"
@@ -215,7 +215,7 @@ file 输出应包含 ARM aarch64，不能是 x86-64。
 
 这个构建使用独立的 build_sparse4d_aarch64 目录，不影响已经编译的 x86 程序。
 
-## 4. 在服务器整理完整部署包
+### 4. 在服务器整理完整部署包
 直接在安装目录补上模型和数据：
 ```bash
 cd "$SAMPLE_ROOT"
@@ -267,11 +267,11 @@ aarch64/
                 └── images/
                     └── …             # 当前帧四张图片
 ```
-
-## 5. 将部署包拷贝到域控制器运行
+# J6部署-板端
+## 1. 将部署包拷贝到域控制器运行
 使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/）。
 
-## 6. 板端执行100帧完整推理
+## 2. 板端执行100帧完整推理
 ```bash
 cd /app/aarch64
 set -o pipefail
@@ -304,7 +304,7 @@ aarch64/
     ├── …
     └── 99/                           # 第100帧结果
 ```
-## 7. 检测结果回放
+## 3. 检测结果回放
 将板端生成的output_100frames拷贝至PC电脑或者服务器里，运行tool/visualization/output_100frames_to_mp4.py脚本，可以将图片变成视频，方便查阅效果。运行前更改第12行input_dir和第13行output_mp4的路径。
 
 
