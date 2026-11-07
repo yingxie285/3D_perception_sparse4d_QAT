@@ -29,7 +29,7 @@ data/
 val_scenes = splits.bevod_val中的bevod_val。【Pylance插件有用就能自动进入splits.py，插件没用就手动点击dataset/utils/custom_nuscenes/utils/splits.py】。
 进入dataset/utils/custom_nuscenes/utils/splits.py找到第151行bevod_train和bevod_val，确认bevod_train和bevod_val的场景划分，保持和train_val_split.json一致（其实就是把train_val_split.json的[]里面的内容对应复制到dataset/utils/custom_nuscenes/utils/splits.py的bevod_train和bevod_val的全局变量定义，覆盖之前的bevod_train和bevod_val的内容）其中，bevod_train就是train_val_split.json里面的"train"，bevod_val就是train_val_split.json里面的"val"，如果更改了就要按ctrl+S保存。
 
-5. 运行data_preprocessing/nusc_anchor_generator.py，得到初始化的anchor（bevod_kmeans900.npy）。运行前记得确认dump_root、save_root的路径对不对。第73行parser.add_argument("--num_anchor", type=int, default=900)900改成384。
+5. 运行data_preprocessing/nusc_anchor_generator.py，得到初始化的anchor（bevod_kmeans384.npy）。运行前记得确认dump_root、save_root的路径对不对。第73行parser.add_argument("--num_anchor", type=int, default=900)900改成384。
 
 最终，数据处理成：
 ```text
@@ -59,13 +59,13 @@ data/
 命令含义如下：
 cd 进入工程文件夹
 source 环境路径
-更改script/train.py和config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py为自己的路径
+更改script/train.py和dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py为自己的路径
 先创建train_log目录，并将重定向的日志0106_r50_bs8.log改为自定义的日志名称。
 
 # 浮点测试
 ## 一、模型推理test可视化
 1. 在launch.json里的"name": "sparse4de2e_visual_new",更改program的路径，更改launch.json的"args"字典里面的路径。
-2. 点击tool/visualization/visulaize_new.py，确认第70行的samples_per_gpu = cfg["data"]["val"].pop("samples_per_gpu", 1)是val，因为示例只划分了train和val。（如果您划分了test，可以写cfg["data"]["tset"]。）
+2. 点击tool/visualization/visulaize_new.py，确认第70行的samples_per_gpu = cfg["data"]["val"].pop("samples_per_gpu", 1)是val，因为示例只划分了train和val。（如果您划分了test，可以写cfg["data"]["test"]。）
 3. 更改第143行save_dir = "/media/whut-user/350b5acb-7342-4f97-b1a7-57e9622bff8b/xy/Sparse4D_no_tracking/visualization_0104_pred_0.5_epoch83"为您的保存路径。
 4. 运行launch.json里的tool/visualization/visulaize_new.py
 （注：模型test用的得分阈值是0.5，如果要修改得分阈值，在modules/head/decoder/decoder.py第15行，修改score_threshold得分阈值）
@@ -86,63 +86,100 @@ python tool/visualization/visulaize_new.py \
 
 
 # J6部署-服务器端
+各步骤按命令中的 cd 切换工作目录。除进入仓库的 cd 外，配置、权重、输出及日志均使用相对路径。
 ## 一、calib阶段
 运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
-需替换实际的config与base-checkpoint的路径，以及日志的名字。参考命令：
+执行校准并编译生成 J6M 的 HBM 模型。使用 fusion8 量化配置，目标架构为 nash-m。其中，ckpt/iter_36800.pth为浮点的权重，CUDA_VISIBLE_DEVICES可以指定显卡。参考命令：
 ```bash
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
-tmux new -s sparse4d_1024calib_fisheye
-export QAT_OUTPUT_PREFIX=1024_fisheye_fix
-HORIZON_QAT=1 \
-CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
-PYTHONPATH=$(pwd)/..:$PYTHONPATH \
-python3 -m torch.distributed.run \
-    --nproc_per_node=1 \
-    --master_port=28671 \
-script/qat_workflow_sparse4d.py \
---config \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
---base-checkpoint \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
---phase calib \
---march nash-m \
---no-validate \
---launcher none \
-2>&1 | tee sparse4d_20261024calib_fisheye.log
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=7
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=perf_r4_fusion8
+
+mkdir -p "Sparse4D_QAT/$QAT_OUTPUT_PREFIX"
+set -o pipefail
+
+python3 script/qat_workflow_sparse4d.py \
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --phase calib \
+  --march nash-m \
+  --device 0 \
+  --launcher none \
+  --no-validate \
+  --skip-onnx \
+  --opt 2 \
+  --output-dir "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export" \
+  2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/calib_compile.log"
 ```
+CUDA_VISIBLE_DEVICES=7 指定物理 GPU 7，该 GPU 在进程内编号为 0，因此使用 --device 0。此处为单 GPU、--launcher none，无需使用 torch.distributed.run。
+
+主要产物如下：
+```text
+Sparse4D_QAT/
+├── perf_r4_fusion8.ckpt  #calib完成后的权重
+└── perf_r4_fusion8/
+    ├── _example_input.pt
+    ├── qconfig_setting/
+    ├── calib_compile.log
+    └── qat_export/
+        ├── model.hbm     #hbm模型，后续会拷贝至板端
+        ├── qat.bc
+        ├── quantize.bc
+        └── advice...
+```
+日志应出现：[PerfQConfig] fusion8
 
 ## 二、测试calib阶段保存的权重
 运行下面的命令会测试calib阶段保存的权重,得到测试集的精度结果，作为定点模型的结果与浮点模型的结果进行对比。
-需替换实际的config、base-checkpoint、calib权重（ckpt）的路径，以及日志的名字。参考命令：
+加载 fusion8 校准权重，在验证集上评估精度，以供与浮点模型比较。参考命令：
 ```bash
-export QAT_OUTPUT_PREFIX=1024_fisheye_fix
-HORIZON_QAT=1 \
-CUDA_VISIBLE_DEVICES=7 \
-PYTHONPATH=$(pwd)/..:$PYTHONPATH \
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=7
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=perf_r4_fusion8
+
+set -o pipefail
+
 python3 script/test_calib.py \
---config \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
---base-checkpoint \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
---checkpoint \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
---march nash-m \
---eval bbox NDS mAP\
-2>&1 | tee eval_data3k测试calib1024_fisheye_fix.log
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --checkpoint "Sparse4D_QAT/${QAT_OUTPUT_PREFIX}.ckpt" \
+  --march nash-m \
+  --launcher none \
+  --eval bbox NDS mAP \
+  2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/eval_calib.log"
 ```
 
 ## 三、calib测试可视化
-与test_calib.py逻辑一致，visulaize_new_calib.py此脚本是得到可视化图片。
-需替换实际的save_dir、checkpoint的路径。参考命令：
+与test_calib.py逻辑一致，运行visulaize_new_calib.py此脚本会得到可视化图片。
+加载同一组 fusion8 校准权重，生成预测结果可视化图片。参考命令：
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-PYTHONPATH=$(pwd):$PYTHONPATH \
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=perf_r4_fusion8
+
+mkdir -p "vis_pred/$QAT_OUTPUT_PREFIX"
+set -o pipefail
+
 python3 tool/visualization/visulaize_new_calib.py \
---config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
---save_dir /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/vis_pred/1028 \
---march nash-m \
---checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/1024_fisheye_fix.ckpt \
---base-checkpoint /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --checkpoint "Sparse4D_QAT/${QAT_OUTPUT_PREFIX}.ckpt" \
+  --save_dir "vis_pred/$QAT_OUTPUT_PREFIX" \
+  --march nash-m \
+  --launcher none \
+  2>&1 | tee "vis_pred/$QAT_OUTPUT_PREFIX/visualize_calib.log"
 ```
 
 ## 四、生成demo数据文件夹，以供板端测试
@@ -165,9 +202,15 @@ python3 tools/sparse4d/export_demo.py \
 若只想导出一个场景，将 --ann-path 改为：
 --ann-path="$REPO_ROOT/data/BEVOD_nusc_anno_dumpjson_mini/val/20240119-211122_20240119-211139.json"
 
-### 2. 使用MobaXterm软件连接域控制器和PC电脑，将100 帧数据的文件夹（demo_100frames）拷贝到板端
-为避免文件丢失，使用zip把demo_100frames文件夹压缩后，再拖动到板端，并解压zip。
-
+### 2.数据随完整部署包一起上传
+本节生成的数据位于 `$SDK_ROOT/samples/ucp_tutorial/all-round/data/sparse4d/demo_100frames`。
+下一节将整个 demo_100frames 目录复制到部署包的 data/ 下。不要在这里单独上传或移动数据；完整部署包整理好后统一打包上传至板端。
+数据路径对应关系如下：
+```text
+服务器导出：all-round/data/sparse4d/demo_100frames/manifest.json
+服务器部署包：all-round/deploy/sparse4d/aarch64/data/demo_100frames/manifest.json
+J6M板端：/app/aarch64/data/demo_100frames/manifest.json
+```
 
 ## 五、J6部署-交叉编译
 在服务器里进行交叉编译，以生成板端能运行的产物。
@@ -216,24 +259,33 @@ file 输出应包含 ARM aarch64，不能是 x86-64。
 这个构建使用独立的 build_sparse4d_aarch64 目录，不影响已经编译的 x86 程序。
 
 ### 4. 在服务器整理完整部署包
-直接在安装目录补上模型和数据：
+在仓库根目录复制本次 fusion8 产物、导出的数据和匹配的接口配置：
 ```bash
-cd "$SAMPLE_ROOT"
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+export REPO_ROOT="$PWD"
+export SDK_ROOT="$REPO_ROOT/horizon_j6_open_explorer_v3.8.1-py310_20260326"
+export SAMPLE_ROOT="$SDK_ROOT/samples/ucp_tutorial/all-round"
 export PACKAGE_ROOT="$SAMPLE_ROOT/deploy/sparse4d/aarch64"
+export QAT_OUTPUT_PREFIX=perf_r4_fusion8
 
-mkdir -p "$PACKAGE_ROOT/model"
-mkdir -p "$PACKAGE_ROOT/data"
-mkdir -p "$PACKAGE_ROOT/configs"
+mkdir -p "$PACKAGE_ROOT/model" "$PACKAGE_ROOT/data" "$PACKAGE_ROOT/configs"
 
-cp "$SDK_ROOT/samples/ucp_tutorial/dnn/basic_samples/code/sparse4d_J6M/assets/model.hbm" \
+cp "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export/model.hbm" \
    "$PACKAGE_ROOT/model/model.hbm"
 
-cp -a "$SAMPLE_ROOT/data/sparse4d/demo_100frames" \
-      "$PACKAGE_ROOT/data/"
+mkdir -p "$PACKAGE_ROOT/data/demo_100frames"
+cp -a "$SAMPLE_ROOT/data/sparse4d/demo_100frames/." \
+      "$PACKAGE_ROOT/data/demo_100frames/"
 
 cp "$SAMPLE_ROOT/configs/sparse4d/model_io.json" \
    "$PACKAGE_ROOT/configs/model_io.json"
+
+sha256sum "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export/model.hbm" \
+          "$PACKAGE_ROOT/model/model.hbm"
+test -f "$PACKAGE_ROOT/data/demo_100frames/manifest.json"
 ```
+两行 SHA256 应一致。
+
 部署包应包含：
 ```text
 aarch64/
@@ -269,7 +321,17 @@ aarch64/
 ```
 # J6部署-板端
 ## 1. 将部署包拷贝到域控制器运行
-使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/）。
+在服务器将完整部署包打包，保留动态库的符号链接和文件权限：
+```bash
+cd "$SAMPLE_ROOT/deploy/sparse4d"
+tar -czf "$SAMPLE_ROOT/aarch64.tar.gz" aarch64
+```
+使用 MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64.tar.gz）拖动复制到域控制器目标目录（app/）。然后在板端执行：
+```bash
+cd /app
+tar -xzf aarch64.tar.gz
+```
+解压后程序目录为 /app/aarch64。不要额外创建一层 aarch64 再解压。
 
 ## 2. 板端执行100帧完整推理
 ```bash
@@ -285,6 +347,7 @@ bash bin/run_sparse4d.sh \
   --num_frames=-1 \
   --warmup=0 \
   --repeat=1 \
+  --preprocess_workers=4 \
   --save_outputs=true \
   --visualize=true \
   --visualize_score_threshold=0.5 \
@@ -292,7 +355,7 @@ bash bin/run_sparse4d.sh \
   --trace=true \
   2>&1 | tee run_100frames.log
 ```
-这里执行一次推理，没有预热。启动脚本设置 nash-m 和包内运行库路径。
+这里遍历 manifest 中的全部帧，每帧推理一次，不预热。启动脚本设置 nash-m 和包内运行库路径。
 
 成功会生成：
 ```text
@@ -319,35 +382,110 @@ output_100frames/
 1. 在服务器里用 nash-p 重新编译模型，得到 J6P 的 HBM。
 2. 复制一份 all-round 部署工程，修改程序名和启动脚本，再交叉编译、打包到 J6P域控制器。
 
-## 一、用 nash-p 重新编译模型
+## 一、用 nash-p 重新校准并编译 J6P 模型
 在script/qat_workflow_sparse4d.py脚本里是通过参数parser.add_argument("--march", )定义的，需通过命令显式传入nash-p。
-运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
-需替换实际的config与base-checkpoint的路径，以及日志的名字。设置独立的 QAT_OUTPUT_PREFIX 和 --output-dir 是为了不覆盖已有的J6M的model.hbm、qat.bc 和 quantize.bc。参考命令：
+执行 run_calib_phase，从浮点权重重新校准并生成 J6P 的 HBM。使用独立输出目录，不覆盖已有 J6M 产物。
+
+如需使用 tmux，先单独创建会话：
+```bash
+tmux new -s sparse4d_calib_fisheye_J6P
+```
+进入会话后执行命令,设置独立的 QAT_OUTPUT_PREFIX 和 --output-dir 是为了不覆盖已有的J6M的model.hbm、qat.bc 和 quantize.bc。参考命令：
 ```bash
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
-tmux new -s sparse4d_calib_fisheye_J6P
-export QAT_OUTPUT_PREFIX=J6P_export
-HORIZON_QAT=1 \
-CUDA_VISIBLE_DEVICES=7 TORCH_DISTRIBUTED_DEBUG=DETAIL \
-PYTHONPATH=$(pwd)/..:$PYTHONPATH \
-python3 -m torch.distributed.run \
-    --nproc_per_node=1 \
-    --master_port=28671 \
-script/qat_workflow_sparse4d.py \
---config \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
---base-checkpoint \
-/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/ckpt/iter_36800.pth \
---phase calib \
---march nash-p \
---no-validate \
---launcher none \
-2>&1 | tee sparse4d_20261030calib_J6P_export.log
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=7
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=J6P_fusion8_export
+
+mkdir -p "Sparse4D_QAT/$QAT_OUTPUT_PREFIX"
+set -o pipefail
+
+python3 script/qat_workflow_sparse4d.py \
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --phase calib \
+  --march nash-p \
+  --device 0 \
+  --launcher none \
+  --no-validate \
+  --skip-onnx \
+  --opt 2 \
+  --output-dir "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export" \
+  2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/calib_compile.log"
 ```
-产物为：/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/J6P_export/qat_export/model.hbm
+这里使用单 GPU 和 --launcher none，无需 torch.distributed.run。物理 GPU 7 在进程内映射为设备 0，因此使用 --device 0。
+主要产物为：
+```text
+Sparse4D_QAT/
+├── J6P_fusion8_export.ckpt
+└── J6P_fusion8_export/
+    ├── _example_input.pt
+    ├── qconfig_setting/
+    ├── calib_compile.log
+    └── qat_export/
+        ├── model.hbm
+        ├── qat.bc
+        ├── quantize.bc
+        └── advice...
+```
+日志应包含：
+```text
+用到的march: nash-p
+[PerfQConfig] fusion8
+```
+
+## 二、测试 J6P 校准权重
+测试时使用相同的 nash-p、fusion8 和输出前缀。
+```bash
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=7
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=J6P_fusion8_export
+
+set -o pipefail
+
+python3 script/test_calib.py \
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --checkpoint "Sparse4D_QAT/${QAT_OUTPUT_PREFIX}.ckpt" \
+  --march nash-p \
+  --launcher none \
+  --eval bbox NDS mAP \
+  2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/eval_calib.log"
+```
+## 三、J6P 校准模型可视化 【可选】
+```bash
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+
+export HORIZON_QAT=1
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH="$PWD:$PWD/..:${PYTHONPATH:-}"
+export SPARSE4D_PERF_MODE=fusion8
+export QAT_OUTPUT_PREFIX=J6P_fusion8_export
+
+mkdir -p "vis_pred/$QAT_OUTPUT_PREFIX"
+set -o pipefail
+
+python3 tool/visualization/visulaize_new_calib.py \
+  --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+  --base-checkpoint ckpt/iter_36800.pth \
+  --checkpoint "Sparse4D_QAT/${QAT_OUTPUT_PREFIX}.ckpt" \
+  --save_dir "vis_pred/$QAT_OUTPUT_PREFIX" \
+  --march nash-p \
+  --launcher none \
+  2>&1 | tee "vis_pred/$QAT_OUTPUT_PREFIX/visualize_calib.log"
+```
+这三步完成的是 J6P 模型生成、精度测试和可视化。 后续部署时，model_io.json 应以新 J6P HBM 实际接口为准，不直接假定与 J6M 相同。fusion8 是沿用的实验配置，其在 J6P 上的精度和性能仍需分别验证。
 
 
-## 二、交叉编译出J6P的部署工程
+
+## 四、交叉编译出J6P的部署工程
 1. 在服务器复制工程
 以下命令在存放完整 SDK 的 Linux 服务器执行。先按你的实际路径修改 SDK_ROOT：
 ```bash
@@ -359,10 +497,10 @@ cd "$UCP_ROOT"
 
 保留已经通过 J6M 板端验证的目录。
 ```bash
-cp -a all-round all-round-j6p
+test ! -e all-round-j6p && cp -a all-round all-round-j6p
 cd all-round-j6p
 ```
-这会复制源码、构建脚本以及目录中现有的数据和构建产物。因此不要直接把旧的 deploy/sparse4d/aarch64 当成 J6P 部署包。下文会让新工程重新构建，并在打包时明确放入新 HBM。
+上面的复制仅用于首次创建副本。若 all-round-j6p 已存在，应继续使用已有副本，不再次执行复制，否则容易形成嵌套目录。复制会包含源码、构建脚本以及目录中现有的数据和构建产物。因此不要直接把旧的 deploy/sparse4d/aarch64 当成 J6P 部署包。下文会让新工程重新构建，并在打包时明确放入新 HBM。
 复制后先确认文件：
 ```bash
 ls CMakeLists.txt build_sparse4d_aarch64.sh run_sparse4d.sh
@@ -371,7 +509,7 @@ ls ../deps_aarch64
 
 2. 修改 all-round-j6p/CMakeLists.txt
 打开all-round-j6p/CMakeLists.txt，其中用到了命名的地方已更改为sparse4d_J6P与J6P，如下所示：
-```bash
+```text
 add_executable(sparse4d_J6P src/sparse4d/main.cc src/sparse4d/sparse4d_runtime.cc)
 target_link_libraries(sparse4d_J6P dnn hbucp gflags opencv_world pthread dl rt)
 set_target_properties(sparse4d_J6P PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
@@ -428,18 +566,22 @@ file deploy/sparse4d/aarch64/bin/sparse4d_J6P
 cd "$UCP_ROOT/all-round-j6p"
 
 export PACKAGE_ROOT="$PWD/deploy/sparse4d/aarch64"
-export J6P_HBM=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/Sparse4D_QAT/J6P_export/qat_export/model.hbm
+export REPO_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+export QAT_OUTPUT_PREFIX=J6P_fusion8_export
+export J6P_HBM="$REPO_ROOT/Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export/model.hbm"
 
 mkdir -p "$PACKAGE_ROOT/model" "$PACKAGE_ROOT/data" "$PACKAGE_ROOT/configs"
 
 cp "$J6P_HBM" "$PACKAGE_ROOT/model/model.hbm"
 cp configs/sparse4d/model_io.json "$PACKAGE_ROOT/configs/"
-cp -a data/sparse4d/demo_100frames "$PACKAGE_ROOT/data/"
+mkdir -p "$PACKAGE_ROOT/data/demo_100frames"
+cp -a "$UCP_ROOT/all-round/data/sparse4d/demo_100frames/." "$PACKAGE_ROOT/data/demo_100frames/"
 
 cd "$PACKAGE_ROOT"
 sha256sum model/model.hbm > model.sha256
 ls -lh bin/sparse4d_J6P model/model.hbm
 ```
+数据直接取自 J6M 工程导出的同一批 100 帧。configs/sparse4d/model_io.json 必须先与新的 J6P HBM 接口核对，不能直接认定 J6M 配置适用。
 此命令会在aarch64文件夹下产生configs、data、model等文件
 ```text
 deploy/
@@ -461,16 +603,16 @@ tar -czvf "$UCP_ROOT/all-round-j6p/aarch64.tar.gz" aarch64/
 ```
 
 
-## 三、 板端执行
-1. 使用MobaXterm软件连接域控制器和PC电脑，将PC电脑里的部署包（aarch64）拖动复制到域控制器目标目录（app/J6P）。
+## 五、 板端执行
+1. 使用MobaXterm软件连接域控制器和PC电脑，将服务器生成的 aarch64.tar.gz 上传到域控制器的 /app/J6P/。该目录不存在时先执行 mkdir -p /app/J6P。
 2. 解压aarch64.tar.gz
 ```bash
-cd app/J6P
+cd /app/J6P
 tar -xzf aarch64.tar.gz
 ```
 3. 板端执行100帧完整推理
 ```bash
-cd /app/aarch64
+cd /app/J6P/aarch64
 set -o pipefail
 
 bash bin/run_sparse4d.sh \
@@ -482,6 +624,7 @@ bash bin/run_sparse4d.sh \
   --num_frames=-1 \
   --warmup=0 \
   --repeat=1 \
+  --preprocess_workers=4 \
   --save_outputs=true \
   --visualize=true \
   --visualize_score_threshold=0.5 \
@@ -489,7 +632,7 @@ bash bin/run_sparse4d.sh \
   --trace=true \
   2>&1 | tee run_j6p_100frames.log
 ```
-这里执行一次推理，没有预热。启动脚本设置了 nash-p 和包内运行库路径。
+这里遍历 manifest 中的全部帧，每帧推理一次，不预热。启动脚本设置了 nash-p 和包内运行库路径。
 
 成功时，并生成：
 ```text
@@ -504,9 +647,9 @@ aarch64/
 
 4. 将板端生成的output_j6p_100frames拷贝至PC电脑或者服务器里，建议在域控制器里用tar打包，再下载到电脑里。
 ```bash
-tar -czvf /app/aarch64/output_j6p_100frames.tar.gz \
--C /app/aarch64 \
-output_j6p_100frames/
+tar -czvf /app/J6P/aarch64/output_j6p_100frames.tar.gz \
+  -C /app/J6P/aarch64 \
+  output_j6p_100frames/
 ```
 
 运行tool/visualization/output_100frames_to_mp4.py脚本，可以将图片变成视频，方便查阅效果。运行前更改第12行input_dir和第13行output_mp4的路径。

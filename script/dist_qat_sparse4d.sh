@@ -1,77 +1,37 @@
-#!/usr/bin/env bash
+run_sparse4d_quant_mode() (
+    set -euo pipefail
 
-CONFIG=$1
-CHECKPOINT=$2
-GPUS=$3
-PHASE=$4
-PORT=${PORT:-29111}
+    cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
 
-EXTRA_ARGS="${@:5}"
+    export HORIZON_QAT=1
+    export CUDA_VISIBLE_DEVICES=7
+    export PYTHONPATH="$PWD/..:${PYTHONPATH:-}"
+    export SPARSE4D_PERF_MODE="$1"
+    export QAT_OUTPUT_PREFIX="$2"
 
-PROJ_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHONPATH="$PROJ_DIR":$PYTHONPATH
+    mkdir -p "$PWD/Sparse4D_QAT/$QAT_OUTPUT_PREFIX"
 
-if [ "$PHASE" = "calib" ]; then
-    echo "============================================"
-    echo "[Phase] Single-GPU calib + export"
-    echo "============================================"
+    python3 script/qat_workflow_sparse4d.py \
+      --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+      --base-checkpoint ckpt/iter_36800.pth \
+      --phase calib \
+      --march nash-m \
+      --device 0 \
+      --launcher none \
+      --no-validate \
+      --skip-onnx \
+      --opt 2 \
+      --output-dir "$PWD/Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export" \
+      2>&1 | tee "$PWD/Sparse4D_QAT/$QAT_OUTPUT_PREFIX/calib_compile.log"
 
-    PYTHONPATH="$PYTHONPATH" python3 "$PROJ_DIR/tools/qat_workflow.py" \
-        "$CONFIG" "$CHECKPOINT" \
-        --phase calib \
-        --launcher none \
-        $EXTRA_ARGS
+    python3 script/test_calib.py \
+      --config dataset/config/sparse4dv3_temporal_r50_1x8_bs6_256x704.py \
+      --base-checkpoint ckpt/iter_36800.pth \
+      --checkpoint "$PWD/Sparse4D_QAT/$QAT_OUTPUT_PREFIX.ckpt" \
+      --march nash-m \
+      --launcher none \
+      --eval bbox NDS mAP \
+      2>&1 | tee "$PWD/Sparse4D_QAT/$QAT_OUTPUT_PREFIX/eval_calib.log"
+)
 
-elif [ "$PHASE" = "train" ]; then
-    echo "============================================"
-    echo "[Phase] Multi-GPU QAT training ($GPUS GPUs)"
-    echo "============================================"
-
-    PYTHONPATH="$PYTHONPATH" python3 -m torch.distributed.launch \
-        --nproc_per_node="$GPUS" \
-        --master_port="$PORT" \
-        "$PROJ_DIR/tools/qat_workflow.py" \
-        "$CONFIG" "$CHECKPOINT" \
-        --phase train \
-        --launcher pytorch \
-        $EXTRA_ARGS
-
-elif [ "$PHASE" = "all" ]; then
-    echo "============================================"
-    echo "[Phase 1] Single-GPU calib + export"
-    echo "============================================"
-
-    PYTHONPATH="$PYTHONPATH" python3 "$PROJ_DIR/tools/qat_workflow.py" \
-        "$CONFIG" "$CHECKPOINT" \
-        --phase calib \
-        --launcher none \
-        $EXTRA_ARGS
-
-    if [ $? -ne 0 ]; then
-        echo "[Phase 1] FAILED"
-        exit 1
-    fi
-
-    echo ""
-    echo "============================================"
-    echo "[Phase 2] Multi-GPU QAT training ($GPUS GPUs)"
-    echo "============================================"
-
-    PYTHONPATH="$PYTHONPATH" python3 -m torch.distributed.launch \
-        --nproc_per_node="$GPUS" \
-        --master_port="$PORT" \
-        "$PROJ_DIR/tools/qat_workflow.py" \
-        "$CONFIG" "$CHECKPOINT" \
-        --phase train \
-        --launcher pytorch \
-        $EXTRA_ARGS
-
-    if [ $? -ne 0 ]; then
-        echo "[Phase 2] FAILED"
-        exit 1
-    fi
-
-else
-    echo "Usage: $0 <CONFIG> <CHECKPOINT> <GPUS> <PHASE: calib|train|all> [EXTRA_ARGS...]"
-    exit 1
-fi
+run_sparse4d_quant_mode linear8 perf_r4_linear8

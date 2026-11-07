@@ -49,7 +49,7 @@
         4,
         4
       ],
-      "dtype": "f32"
+      "dtype": "s16"
     },
     {
       "name": "_input_5",
