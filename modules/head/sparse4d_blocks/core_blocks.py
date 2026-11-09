@@ -739,26 +739,52 @@ class DeformableAttentionAggr(BaseModule):
         return features
     
     #1016 和sparsedrive一致
+    # def horizon_multi_view_level_fusion(
+    #     self,
+    #     features: torch.Tensor,
+    #     weights: torch.Tensor,
+    # ):
+    #     bs, num_anchor = weights.shape[:2]
+    #     feat = features.reshape(bs, num_anchor, -1, self.num_pts,
+    #                             self.num_groups, self.group_dims)
+    #     w = weights.reshape(bs, num_anchor, -1, self.num_pts, self.num_groups)
+
+    #     N = bs * num_anchor * self.num_pts * self.num_groups
+    #     w_bmm = w.permute(0, 1, 3, 4, 2).reshape(N, 1, -1)
+    #     feat_bmm = feat.permute(0, 1, 3, 4, 2, 5).reshape(N, -1, self.group_dims)
+
+    #     out = self.fusion_matmul(w_bmm, feat_bmm)
+    #     out = out.reshape(bs, num_anchor, self.num_pts, self.num_groups, self.group_dims)
+    #     out = out.reshape(bs, num_anchor, self.num_pts, self.embed_dims)
+    #     return out
+    
+    #优化：把相机、层级、采样点一起作为Matmul归约维度，直接生成后续需要的[1,384,256]。
     def horizon_multi_view_level_fusion(
         self,
         features: torch.Tensor,
         weights: torch.Tensor,
     ):
         bs, num_anchor = weights.shape[:2]
-        feat = features.reshape(bs, num_anchor, -1, self.num_pts,
-                                self.num_groups, self.group_dims)
-        w = weights.reshape(bs, num_anchor, -1, self.num_pts, self.num_groups)
+        feat = features.reshape(
+            bs, num_anchor, -1, self.num_pts,
+            self.num_groups, self.group_dims,
+        )
+        w = weights.reshape(
+            bs, num_anchor, -1, self.num_pts, self.num_groups,
+        )
 
-        N = bs * num_anchor * self.num_pts * self.num_groups
-        w_bmm = w.permute(0, 1, 3, 4, 2).reshape(N, 1, -1)
-        feat_bmm = feat.permute(0, 1, 3, 4, 2, 5).reshape(N, -1, self.group_dims)
-
+        # Reduce cameras, feature levels and sampling points together.
+        batch_groups = bs * num_anchor * self.num_groups
+        w_bmm = w.permute(0, 1, 4, 2, 3).reshape(
+            batch_groups, 1, -1,
+        )
+        feat_bmm = feat.permute(0, 1, 4, 2, 3, 5).reshape(
+            batch_groups, -1, self.group_dims,
+        )
         out = self.fusion_matmul(w_bmm, feat_bmm)
-        out = out.reshape(bs, num_anchor, self.num_pts, self.num_groups, self.group_dims)
-        out = out.reshape(bs, num_anchor, self.num_pts, self.embed_dims)
-        return out
+        return out.reshape(bs, num_anchor, self.embed_dims)
 
-#-------------------------------------0930---------------------------------------
+#-------------------用自定义的horizon_forward-------------------
     def horizon_forward(
         self,
         instance_feature,
@@ -862,9 +888,9 @@ class DeformableAttentionAggr(BaseModule):
         )
 
         # =========================================================
-        # 6. Point fusion
+        # 6. 采样点归约已在矩阵乘法内完成，因此注释features = features.sum(dim=2)
         # =========================================================
-        features = features.sum(dim=2)
+        # features = features.sum(dim=2)
         # print("走的else分支")
 
         # =========================================================
