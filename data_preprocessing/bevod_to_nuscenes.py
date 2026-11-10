@@ -1039,7 +1039,7 @@ def _build_sample_data_one(args):
          'is_key_frame': True, 'height': 1200, 'width': 1920, 'filename': right_path, 'prev': prev, 'next': nxt},
         {'token': token_list[2], 'sample_token': token, 'ego_pose_token': token,
          'calibrated_sensor_token': ct_left, 'timestamp': timestamp, 'fileformat': 'jpg',
-         'is_key_frame': True, 'height': 1536, 'width': 1920, 'filename': left_path, 'prev': prev, 'next': nxt},
+         'is_key_frame': True, 'height': 1200, 'width': 1920, 'filename': left_path, 'prev': prev, 'next': nxt},
         {'token': token_list[3], 'sample_token': token, 'ego_pose_token': token,
          'calibrated_sensor_token': ct_back, 'timestamp': timestamp, 'fileformat': 'jpg',
          'is_key_frame': True, 'height': 1200, 'width': 1920, 'filename': back_path, 'prev': prev, 'next': nxt},
