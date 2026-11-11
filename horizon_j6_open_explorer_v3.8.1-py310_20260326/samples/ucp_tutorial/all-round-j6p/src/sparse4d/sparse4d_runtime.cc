@@ -20,6 +20,18 @@ namespace fs = sparse4d::files;
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <array>  //C++前处理四相机并行
+#include <future> //C++前处理四相机并行
+// 线程池、互斥锁、条件变量、有界队列和输入缓冲所有权需要以下这些标准库组件
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <utility>
 
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
@@ -28,7 +40,8 @@ static double ms(Clock::time_point t)
 {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
-static bool trace_enabled = false;
+// static bool trace_enabled = false;
+static std::atomic<bool> trace_enabled{false};
 static const auto process_start = Clock::now();
 static void trace(const std::string &message)
 {
@@ -87,13 +100,16 @@ DEFINE_bool(dump_inputs, false, "Save logical and packed inputs");
 DEFINE_bool(visualize, true, "Save camera overlays and BEV");
 DEFINE_bool(trace, true, "Print execution stages");
 DEFINE_int32(num_frames, 1, "Frames to run, -1 for all");
-DEFINE_int32(core_id, 0, "0=any, 1=core0");
+DEFINE_bool(pipeline, false, "Overlap ordered preparation/packing with one BPU consumer"); // 默认保持串行模式，便于同一可执行文件做串行/流水线对照。只有显式传入--pipeline=true才启用跨帧重叠。
+DEFINE_int32(core_id, 0, "0=any, 1=core0 (J6P)");
 DEFINE_int32(task_timeout_ms, 0, "UCP wait timeout; 0 follows reference infinite wait");
 DEFINE_int32(warmup, 0, "Warmup iterations");
 DEFINE_int32(repeat, 1, "Measured iterations per frame");
 DEFINE_int32(top_k, 300, "Global detection top-k");
 DEFINE_double(score_threshold, 0.0, "Saved detection threshold");
 DEFINE_double(visualize_score_threshold, 0.5, "Display threshold only");
+DEFINE_int32(preprocess_workers, 4,
+             "Concurrent camera preprocessing workers, 1..4"); // C++前处理四相机并行
 static Options options(const std::string &frame, const std::string &output)
 {
     Options o;
@@ -111,7 +127,7 @@ static Options options(const std::string &frame, const std::string &output)
     o.threshold = float(FLAGS_score_threshold);
     require(o.repeat > 0 && o.warmup >= 0 && o.top_k > 0, "Invalid iteration/top-k settings");
     require(o.threshold >= 0 && o.threshold <= 1, "Invalid score threshold");
-    require(FLAGS_core_id == 0 || FLAGS_core_id == 1, "core_id must be 0 (any) or 1 (core0)");
+    require(FLAGS_core_id == 0 || FLAGS_core_id == 1, "J6P core_id must be 0 or 1");
     require(FLAGS_task_timeout_ms >= 0, "Negative task timeout");
     return o;
 }
@@ -163,6 +179,71 @@ static void append(std::vector<float> &dst, const double *src, size_t n)
     for (size_t i = 0; i < n; ++i)
         dst.push_back(float(src[i]));
 }
+
+// 新增固定相机线程池
+class CameraWorkers
+{
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<std::function<void()>> jobs_;
+    std::vector<std::thread> threads_;
+    bool stop_ = false;
+
+public:
+    explicit CameraWorkers(int count)
+    {
+        try
+        {
+            for (int i = 0; i < count; ++i)
+                threads_.emplace_back([this]
+                                      {
+                    for (;;) {
+                        std::function<void()> job;
+                        {
+                            std::unique_lock<std::mutex> lock(mutex_);
+                            ready_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                            if (stop_ && jobs_.empty()) return;
+                            job = std::move(jobs_.front());
+                            jobs_.pop();
+                        }
+                        job();
+                    } });
+        }
+        catch (...)
+        {
+            shutdown();
+            throw;
+        }
+    }
+    CameraWorkers(const CameraWorkers &) = delete;
+    CameraWorkers &operator=(const CameraWorkers &) = delete;
+    std::future<void> submit(std::function<void()> fn)
+    {
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(fn));
+        auto result = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.emplace([task]
+                          { (*task)(); });
+        }
+        ready_.notify_one();
+        return result;
+    }
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        ready_.notify_all();
+        for (auto &thread : threads_)
+            if (thread.joinable())
+                thread.join();
+    }
+    ~CameraWorkers() { shutdown(); }
+};
+
+// C++前处理四相机并行
 static Frame preprocess(const fs::path &path)
 {
     Frame f;
@@ -173,18 +254,24 @@ static Frame preprocess(const fs::path &path)
     const auto &p = j.at("preprocess");
     require(!p.value("flip", false) && p.value("rotate", 0.) == 0.,
             "Only deterministic test augmentation supported.");
-    double resize = p.at("resize").get<double>();
-    auto crop = p.at("crop").get<std::vector<int>>();
-    require(crop.size() == 4 && crop[2] - crop[0] == 704 && crop[3] - crop[1] == 256, "Expected 704x256 crop.");
-    require(std::isfinite(resize) && resize > 0 && resize <= 10, "Invalid resize.");
-    auto mean = numbers<3>(p.at("mean")), stddev = numbers<3>(p.at("std"));
-    // Python stores config mean/std as float32 before promoting them for OpenCV.
+
+    const double resize = p.at("resize").get<double>();
+    const auto crop = p.at("crop").get<std::vector<int>>();
+    require(crop.size() == 4 && crop[2] - crop[0] == 704 &&
+                crop[3] - crop[1] == 256,
+            "Expected 704x256 crop.");
+    require(std::isfinite(resize) && resize > 0 && resize <= 10,
+            "Invalid resize.");
+
+    auto mean = numbers<3>(p.at("mean"));
+    auto stddev = numbers<3>(p.at("std"));
     for (double &v : mean)
         v = double(float(v));
     for (double &v : stddev)
         v = double(float(v));
     for (double v : stddev)
         require(v > 0, "Normalization std must be positive.");
+
     f.inputs["img"].shape = {1, 4, 3, 256, 704};
     f.inputs["cam_extrinsic"].shape = {1, 4, 4, 4};
     f.inputs["cam_intrinsic"].shape = {1, 4, 3, 3};
@@ -192,11 +279,32 @@ static Frame preprocess(const fs::path &path)
     f.inputs["lidar2img"].shape = {1, 4, 4, 4};
     f.inputs["image_wh"] = {{1, 2}, {256.f, 704.f}};
     f.inputs["time_interval"] = {{1}, {float(j.value("time_interval", 1.0))}};
-    require(f.inputs["time_interval"].data[0] == 1.f, "Non-temporal export requires time_interval=1.");
+    require(f.inputs["time_interval"].data[0] == 1.f,
+            "Non-temporal export requires time_interval=1.");
+
+    cv::Mat norm_table(1, 256, CV_32FC3);
+    for (int v = 0; v < 256; ++v)
+        norm_table.at<cv::Vec3f>(0, v) =
+            cv::Vec3f(float(v), float(v), float(v));
+    cv::subtract(norm_table, cv::Scalar(mean[0], mean[1], mean[2]),
+                 norm_table);
+    cv::multiply(norm_table,
+                 cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]),
+                 norm_table);
+
+    const auto *lut = norm_table.ptr<cv::Vec3f>(0);
+    const bool to_rgb = p.value("to_rgb", true);
+    constexpr size_t plane_size = size_t(256) * 704;
+    auto &img = f.inputs["img"].data;
+    img.resize(size_t(4) * 3 * plane_size);
+    f.cameras.resize(4);
+
+    // Prepare all containers before starting worker threads.
     std::set<std::string> seen;
-    for (const auto &cj : j.at("cameras"))
+    for (size_t i = 0; i < 4; ++i)
     {
-        Camera c;
+        const auto &cj = j.at("cameras").at(i);
+        auto &c = f.cameras[i];
         c.name = cj.at("name").get<std::string>();
         require(seen.insert(c.name).second, "Duplicate camera name.");
         c.path = fs::path(cj.at("image").get<std::string>());
@@ -206,39 +314,129 @@ static Frame preprocess(const fs::path &path)
         c.e = numbers<16>(cj.at("cam_extrinsic"));
         c.distortion = numbers<4>(cj.at("cam_distortion"));
         c.lidar2img = numbers<16>(cj.at("lidar2img"));
+    }
+
+    auto process_camera = [&](size_t i)
+    {
+        std::fesetround(FE_TONEAREST);
+        auto &c = f.cameras[i];
         c.image = cv::imread(c.path.string(), cv::IMREAD_COLOR);
         require(!c.image.empty(), "Cannot load " + c.path.string());
-        if (!f.cameras.empty())
-            require(c.image.size() == f.cameras[0].image.size(), "Camera dimensions differ.");
-        int rw = int(c.image.cols * resize), rh = int(c.image.rows * resize);
+        const int rw = int(c.image.cols * resize);
+        const int rh = int(c.image.rows * resize);
         require(rw > 0 && rh > 0, "Empty resize.");
-        std::cout << "camera[" << f.cameras.size() << "] " << c.name << " " << c.image.cols << "x" << c.image.rows
-                  << " -> " << rw << "x" << rh << " -> crop " << crop[0] << "," << crop[1] << ",704,256\n";
-        cv::Mat resized, patch = cv::Mat::zeros(256, 704, CV_8UC3);
-        // _img_transform recomputes dsize from actual image dimensions.
-        cv::resize(c.image, resized, cv::Size(rw, rh), 0, 0, cv::INTER_LINEAR);
-        cv::Rect region(crop[0], crop[1], 704, 256), available(0, 0, rw, rh);
-        cv::Rect intersection = region & available;
-        // PIL.crop fills out-of-bounds pixels with zero.
+
+        cv::Mat resized;
+        cv::resize(c.image, resized, cv::Size(rw, rh),
+                   0, 0, cv::INTER_LINEAR);
+        cv::Mat patch = cv::Mat::zeros(256, 704, CV_8UC3);
+        const cv::Rect region(crop[0], crop[1], 704, 256);
+        const cv::Rect intersection = region & cv::Rect(0, 0, rw, rh);
         if (intersection.area() > 0)
             resized(intersection).copyTo(patch(cv::Rect(intersection.x - region.x, intersection.y - region.y, intersection.width, intersection.height)));
-        cv::Mat normalized;
-        patch.convertTo(normalized, CV_32FC3);
-        if (p.value("to_rgb", true))
-            cv::cvtColor(normalized, normalized, cv::COLOR_BGR2RGB);
-        cv::subtract(normalized, cv::Scalar(mean[0], mean[1], mean[2]), normalized);
-        cv::multiply(normalized, cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]), normalized);
-        auto &img = f.inputs["img"].data;
-        for (int ch = 0; ch < 3; ++ch)
-            for (int y = 0; y < 256; ++y)
+
+        float *dst0 = img.data() + i * 3 * plane_size;
+        float *dst1 = dst0 + plane_size;
+        float *dst2 = dst1 + plane_size;
+        const int src0 = to_rgb ? 2 : 0;
+        const int src2 = to_rgb ? 0 : 2;
+        for (int y = 0; y < 256; ++y)
+        {
+            const auto *row = patch.ptr<cv::Vec3b>(y);
+            const size_t offset = size_t(y) * 704;
+            for (int x = 0; x < 704; ++x)
             {
-                const auto *row = normalized.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < 704; ++x)
-                    img.push_back(row[x][ch]);
+                const auto pixel = row[x];
+                dst0[offset + x] = lut[pixel[src0]][0];
+                dst1[offset + x] = lut[pixel[1]][1];
+                dst2[offset + x] = lut[pixel[src2]][2];
             }
+        }
+    };
+
+    // const int workers = FLAGS_preprocess_workers;
+    // if (workers == 1)
+    // {
+    //     for (size_t i = 0; i < 4; ++i)
+    //         process_camera(i);
+    // }
+    // else
+    // {
+    //     std::vector<std::future<void>> jobs;
+    //     jobs.reserve(workers);
+    //     for (int worker = 0; worker < workers; ++worker)
+    //     {
+    //         jobs.emplace_back(std::async(
+    //             std::launch::async,
+    //             [&, worker]
+    //             {
+    //                 for (size_t i = size_t(worker); i < 4;
+    //                      i += size_t(workers))
+    //                     process_camera(i);
+    //             }));
+    //     }
+    //     for (auto &job : jobs)
+    //         job.get();
+    // }
+
+    // 替换preprocess中的相机调度段
+    const int workers = FLAGS_preprocess_workers;
+    if (workers == 1)
+    {
+        for (size_t i = 0; i < 4; ++i)
+            process_camera(i);
+    }
+    else
+    {
+        static CameraWorkers pool(workers);
+        std::vector<std::future<void>> jobs;
+        jobs.reserve(workers);
+        std::exception_ptr error;
+        try
+        {
+            for (int worker = 0; worker < workers; ++worker)
+                jobs.emplace_back(pool.submit([&, worker]
+                                              {
+                    for (size_t i = size_t(worker); i < 4; i += size_t(workers))
+                        process_camera(i); }));
+        }
+        catch (...)
+        {
+            error = std::current_exception();
+        }
+        // Drain all jobs before Frame/lut locals can be destroyed.
+        for (auto &job : jobs)
+        {
+            try
+            {
+                job.get();
+            }
+            catch (...)
+            {
+                if (!error)
+                    error = std::current_exception();
+            }
+        }
+        if (error)
+            std::rethrow_exception(error);
+    }
+
+    // Append metadata only after workers have completed, in camera order.
+    for (size_t i = 0; i < 4; ++i)
+    {
+        const auto &c = f.cameras[i];
+        require(c.image.size() == f.cameras[0].image.size(),
+                "Camera dimensions differ.");
+        if (FLAGS_trace)
+            std::cout << "camera[" << i << "] " << c.name << " "
+                      << c.image.cols << "x" << c.image.rows
+                      << " -> " << int(c.image.cols * resize)
+                      << "x" << int(c.image.rows * resize)
+                      << " -> crop " << crop[0] << "," << crop[1]
+                      << ",704,256\n";
+
         append(f.inputs["cam_extrinsic"].data, c.e.data(), 16);
         auto inference_k = c.k;
-        // Exact repo behavior: scale entire 3x3 including K[2,2]; no crop subtraction in K.
         for (auto &v : inference_k)
             v *= resize;
         append(f.inputs["cam_intrinsic"].data, inference_k.data(), 9);
@@ -250,11 +448,154 @@ static Frame preprocess(const fs::path &path)
             l2i[4 + col] = resize * c.lidar2img[4 + col] - crop[1] * c.lidar2img[8 + col];
         }
         append(f.inputs["lidar2img"].data, l2i.data(), 16);
-        // image_wh is one [H,W] pair per batch, NOT one pair per camera.
-        f.cameras.push_back(std::move(c));
     }
     return f;
 }
+
+// 下面是原先的preprocess
+// static Frame preprocess(const fs::path &path)
+// {
+//     Frame f;
+//     f.manifest = read_json(path);
+//     const auto &j = f.manifest;
+//     require(j.at("schema_version") == 1, "Unsupported manifest schema.");
+//     require(j.at("cameras").size() == 4, "Exactly four cameras required.");
+//     const auto &p = j.at("preprocess");
+//     require(!p.value("flip", false) && p.value("rotate", 0.) == 0.,
+//             "Only deterministic test augmentation supported.");
+//     double resize = p.at("resize").get<double>();
+//     auto crop = p.at("crop").get<std::vector<int>>();
+//     require(crop.size() == 4 && crop[2] - crop[0] == 704 && crop[3] - crop[1] == 256, "Expected 704x256 crop.");
+//     require(std::isfinite(resize) && resize > 0 && resize <= 10, "Invalid resize.");
+//     auto mean = numbers<3>(p.at("mean")), stddev = numbers<3>(p.at("std"));
+//     // Python stores config mean/std as float32 before promoting them for OpenCV.
+//     for (double &v : mean)
+//         v = double(float(v));
+//     for (double &v : stddev)
+//         v = double(float(v));
+//     for (double v : stddev)
+//         require(v > 0, "Normalization std must be positive.");
+//     f.inputs["img"].shape = {1, 4, 3, 256, 704};
+//     f.inputs["cam_extrinsic"].shape = {1, 4, 4, 4};
+//     f.inputs["cam_intrinsic"].shape = {1, 4, 3, 3};
+//     f.inputs["cam_distortion"].shape = {1, 4, 4};
+//     f.inputs["lidar2img"].shape = {1, 4, 4, 4};
+//     f.inputs["image_wh"] = {{1, 2}, {256.f, 704.f}};
+//     f.inputs["time_interval"] = {{1}, {float(j.value("time_interval", 1.0))}};
+//     require(f.inputs["time_interval"].data[0] == 1.f, "Non-temporal export requires time_interval=1.");
+
+//     // 在相机循环前增加查表与预分配 Build the same two-stage normalization with the existing OpenCV
+//     //  arithmetic, once for all possible uint8 pixel values.
+//     cv::Mat norm_table(1, 256, CV_32FC3);
+//     for (int v = 0; v < 256; ++v)
+//     {
+//         norm_table.at<cv::Vec3f>(0, v) =
+//             cv::Vec3f(float(v), float(v), float(v));
+//     }
+//     cv::subtract(
+//         norm_table,
+//         cv::Scalar(mean[0], mean[1], mean[2]),
+//         norm_table);
+//     cv::multiply(
+//         norm_table,
+//         cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]),
+//         norm_table);
+
+//     const auto *lut = norm_table.ptr<cv::Vec3f>(0);
+//     const bool to_rgb = p.value("to_rgb", true);
+//     constexpr size_t plane_size = size_t(256) * 704;
+
+//     auto &img = f.inputs["img"].data;
+//     img.resize(size_t(4) * 3 * plane_size);
+//     f.cameras.reserve(4); // 在相机循环前增加查表与预分配
+
+//     std::set<std::string> seen;
+//     for (const auto &cj : j.at("cameras"))
+//     {
+//         Camera c;
+//         c.name = cj.at("name").get<std::string>();
+//         require(seen.insert(c.name).second, "Duplicate camera name.");
+//         c.path = fs::path(cj.at("image").get<std::string>());
+//         if (c.path.is_relative())
+//             c.path = path.parent_path() / c.path;
+//         c.k = numbers<9>(cj.at("cam_intrinsic"));
+//         c.e = numbers<16>(cj.at("cam_extrinsic"));
+//         c.distortion = numbers<4>(cj.at("cam_distortion"));
+//         c.lidar2img = numbers<16>(cj.at("lidar2img"));
+//         c.image = cv::imread(c.path.string(), cv::IMREAD_COLOR);
+//         require(!c.image.empty(), "Cannot load " + c.path.string());
+//         if (!f.cameras.empty())
+//             require(c.image.size() == f.cameras[0].image.size(), "Camera dimensions differ.");
+//         int rw = int(c.image.cols * resize), rh = int(c.image.rows * resize);
+//         require(rw > 0 && rh > 0, "Empty resize.");
+//         std::cout << "camera[" << f.cameras.size() << "] " << c.name << " " << c.image.cols << "x" << c.image.rows
+//                   << " -> " << rw << "x" << rh << " -> crop " << crop[0] << "," << crop[1] << ",704,256\n";
+//         cv::Mat resized, patch = cv::Mat::zeros(256, 704, CV_8UC3);
+//         // _img_transform recomputes dsize from actual image dimensions.
+//         cv::resize(c.image, resized, cv::Size(rw, rh), 0, 0, cv::INTER_LINEAR);
+//         cv::Rect region(crop[0], crop[1], 704, 256), available(0, 0, rw, rh);
+//         cv::Rect intersection = region & available;
+//         // PIL.crop fills out-of-bounds pixels with zero.
+//         if (intersection.area() > 0)
+//             resized(intersection).copyTo(patch(cv::Rect(intersection.x - region.x, intersection.y - region.y, intersection.width, intersection.height)));
+//         // cv::Mat normalized;
+//         // patch.convertTo(normalized, CV_32FC3);
+//         // if (p.value("to_rgb", true))
+//         //     cv::cvtColor(normalized, normalized, cv::COLOR_BGR2RGB);
+//         // cv::subtract(normalized, cv::Scalar(mean[0], mean[1], mean[2]), normalized);
+//         // cv::multiply(normalized, cv::Scalar(1 / stddev[0], 1 / stddev[1], 1 / stddev[2]), normalized);
+//         // auto &img = f.inputs["img"].data;
+//         // for (int ch = 0; ch < 3; ++ch)
+//         //     for (int y = 0; y < 256; ++y)
+//         //     {
+//         //         const auto *row = normalized.ptr<cv::Vec3f>(y);
+//         //         for (int x = 0; x < 704; ++x)
+//         //             img.push_back(row[x][ch]);
+//         //     }
+
+//         // 替换归一化及 push_back 部分
+//         const size_t camera_index = f.cameras.size();
+
+//         float *dst0 = img.data() + camera_index * 3 * plane_size;
+//         float *dst1 = dst0 + plane_size;
+//         float *dst2 = dst1 + plane_size;
+
+//         const int src0 = to_rgb ? 2 : 0;
+//         const int src2 = to_rgb ? 0 : 2;
+
+//         for (int y = 0; y < 256; ++y)
+//         {
+//             const auto *row = patch.ptr<cv::Vec3b>(y);
+//             const size_t offset = size_t(y) * 704;
+
+//             for (int x = 0; x < 704; ++x)
+//             {
+//                 const auto pixel = row[x];
+//                 dst0[offset + x] = lut[pixel[src0]][0];
+//                 dst1[offset + x] = lut[pixel[1]][1];
+//                 dst2[offset + x] = lut[pixel[src2]][2];
+//             }
+//         } // 一次性分配图像 Tensor，避免逐元素 push_back 的容量检查和扩容。
+
+//         append(f.inputs["cam_extrinsic"].data, c.e.data(), 16);
+//         auto inference_k = c.k;
+//         // Exact repo behavior: scale entire 3x3 including K[2,2]; no crop subtraction in K.
+//         for (auto &v : inference_k)
+//             v *= resize;
+//         append(f.inputs["cam_intrinsic"].data, inference_k.data(), 9);
+//         append(f.inputs["cam_distortion"].data, c.distortion.data(), 4);
+//         auto l2i = c.lidar2img;
+//         for (int col = 0; col < 4; ++col)
+//         {
+//             l2i[col] = resize * c.lidar2img[col] - crop[0] * c.lidar2img[8 + col];
+//             l2i[4 + col] = resize * c.lidar2img[4 + col] - crop[1] * c.lidar2img[8 + col];
+//         }
+//         append(f.inputs["lidar2img"].data, l2i.data(), 16);
+//         // image_wh is one [H,W] pair per batch, NOT one pair per camera.
+//         f.cameras.push_back(std::move(c));
+//     }
+//     return f;
+// }
 static void dump_floats(const fs::path &path, const std::vector<float> &data)
 {
     std::ofstream out(path.string(), std::ios::binary);
@@ -402,6 +743,14 @@ struct Model
                                   { return hbUCPMallocCached(&t.sysMem, bytes, 0); }),
                       "hbUCPMallocCached");
             }
+    }
+    void allocate_outputs() // Model中增加输出缓冲分配函数
+    {
+        for (auto &t : outputs)
+        {
+            size_t bytes = resolve_strides(t.properties);
+            check(hbUCPMallocCached(&t.sysMem, bytes, 0), "allocate output");
+        }
     }
     double infer()
     {
@@ -600,9 +949,303 @@ static void visualize(const Frame &f, const std::vector<Detection> &detections, 
     }
     save_image(out / "bev.jpg", bev);
 }
-static int run_frame(const Options &o, Model &m)
+
+// 新增有序队列及输入槽
+template <class Slot, size_t Capacity>
+class OrderedSlots
 {
-    auto frame_start = Clock::now();
+    std::array<std::unique_ptr<Slot>, Capacity> slots_;
+    std::queue<size_t> free_, ready_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool stop_ = false, done_ = false;
+    std::exception_ptr error_;
+    std::thread producer_;
+
+public:
+    template <class Factory, class Prepare>
+    OrderedSlots(size_t count, Factory factory, Prepare prepare)
+    {
+        for (size_t i = 0; i < Capacity; ++i)
+        {
+            slots_[i] = factory();
+            free_.push(i);
+        }
+        producer_ = std::thread([this, count, prepare]
+                                {
+            try {
+                for (size_t sequence = 0; sequence < count; ++sequence) {
+                    size_t i;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        changed_.wait(lock, [this] { return stop_ || !free_.empty(); });
+                        if (stop_) return;
+                        i = free_.front();
+                        free_.pop();
+                    }
+                    prepare(*slots_[i], sequence);
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (stop_) return;
+                        ready_.push(i);
+                    }
+                    changed_.notify_all();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    done_ = true;
+                }
+                changed_.notify_all();
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    error_ = std::current_exception();
+                    done_ = true;
+                }
+                changed_.notify_all();
+            } });
+    }
+    OrderedSlots(const OrderedSlots &) = delete;
+    OrderedSlots &operator=(const OrderedSlots &) = delete;
+    bool take(size_t &i)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [this]
+                      { return stop_ || done_ || error_ || !ready_.empty(); });
+        if (error_)
+            std::rethrow_exception(error_);
+        if (stop_ || ready_.empty())
+            return false;
+        i = ready_.front();
+        ready_.pop();
+        return true;
+    }
+    Slot &at(size_t i) { return *slots_.at(i); }
+    void release(size_t i)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            free_.push(i);
+        }
+        changed_.notify_all();
+    }
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        changed_.notify_all();
+        if (producer_.joinable())
+            producer_.join();
+    }
+    ~OrderedSlots() { shutdown(); }
+};
+
+struct PreparedFrame
+{
+    // buffers owns only its input allocations, never an HBM handle/output buffer.
+    Model buffers;
+    Frame frame;
+    std::vector<std::vector<float>> values;
+    size_t sequence = 0;
+    Clock::time_point started, ready;
+    double preprocess_ms = 0, bind_ms = 0, pack_ms = 0, consumer_wait_ms = 0;
+};
+static std::unique_ptr<PreparedFrame> make_input_slot(const Model &model)
+{
+    auto slot = std::make_unique<PreparedFrame>();
+    auto &b = slot->buffers;
+    b.input_names = model.input_names;
+    b.output_names = model.output_names;
+    b.inputs.resize(model.inputs.size());
+    b.outputs.resize(model.outputs.size());
+    for (size_t i = 0; i < b.inputs.size(); ++i)
+    {
+        b.inputs[i] = {};
+        b.inputs[i].properties = model.inputs[i].properties;
+        const size_t bytes = resolve_strides(b.inputs[i].properties);
+        check(hbUCPMallocCached(&b.inputs[i].sysMem, bytes, 0), "allocate input slot");
+    }
+    for (size_t i = 0; i < b.outputs.size(); ++i)
+    {
+        b.outputs[i] = {};
+        b.outputs[i].properties = model.outputs[i].properties;
+    }
+    return slot;
+}
+//-----------------------------------------------------------------
+
+// static int run_frame(const Options &o, Model &m)
+// {
+//     auto frame_start = Clock::now();
+//     try
+//     {
+//         std::fesetround(FE_TONEAREST);
+//         trace_enabled = o.trace;
+//         trace("sparse4d_J6P diagnostic revision 2; warmup=" + std::to_string(o.warmup) + " repeat=" + std::to_string(o.repeat));
+//         fs::create_directories(o.out);
+//         json timing;
+//         Frame f;
+//         if (!o.inspect)
+//         {
+//             auto t = Clock::now();
+//             f = preprocess(o.frame);
+//             timing["load_images_and_preprocess_ms"] = ms(t);
+//             timing["preprocess_workers"] = FLAGS_preprocess_workers; // C++前处理四相机并行
+//             timing["opencv_threads"] = cv::getNumThreads();          // C++前处理四相机并行
+//             if (o.dump || o.preprocess_only)
+//                 dump_inputs(f, o.out / "inputs");
+//             if (o.preprocess_only)
+//             {
+//                 save_json(o.out / "timing.json", timing);
+//                 return 0;
+//             }
+//         }
+//         auto load_start = Clock::now();
+//         if (!m.packed)
+//             m.load(o);
+//         timing["model_load_ms"] = ms(load_start);
+//         auto interface = m.describe();
+//         if (!FLAGS_model_io.empty())
+//         {
+//             auto expected = read_json(FLAGS_model_io);
+//             for (const auto *side : {"inputs", "outputs"})
+//             {
+//                 require(expected.at(side).size() == interface.at(side).size(), "HBM IO count mismatch");
+//                 for (size_t i = 0; i < expected.at(side).size(); ++i)
+//                     for (auto it = expected.at(side)[i].begin(); it != expected.at(side)[i].end(); ++it)
+//                         require(interface.at(side)[i].at(it.key()) == it.value(), "HBM IO property mismatch: " + it.key());
+//             }
+//         }
+//         trace("write hbm_interface.json ENTER");
+//         save_json(o.out / "hbm_interface.json", interface);
+//         trace("write hbm_interface.json DONE");
+//         if (o.inspect)
+//             return 0;
+//         trace("bind inputs ENTER");
+//         auto values = bind_inputs(m, f);
+//         trace("bind inputs DONE");
+//         size_t cls = binding(m.output_names, f.manifest, "output_bindings", "classification", 0);
+//         size_t box = binding(m.output_names, f.manifest, "output_bindings", "prediction", 1);
+//         require(cls != box, "Duplicate output binding.");
+//         for (size_t n : {cls, box})
+//             require(is_float_type(m.outputs[n].properties.tensorType) ||
+//                         m.outputs[n].properties.quantiType == SCALE,
+//                     "Integer detection output has no quantization scale; cannot decode physical boxes/logits.");
+//         auto cs = squeezed(shape_of(m.outputs[cls].properties)), bs = squeezed(shape_of(m.outputs[box].properties));
+//         require(cs.size() == 2 && bs.size() == 2 && cs[0] == bs[0] && cs[1] == 13 && bs[1] == 8,
+//                 "Expected class [1,Q,13] and boxes [1,Q,8]; inspect hbm_interface.json.");
+//         if (!m.inputs[0].sysMem.virAddr)
+//             m.allocate();
+//         auto pack_start = Clock::now();
+//         pack_and_clean(m, values);
+//         timing["input_pack_and_clean_ms"] = ms(pack_start);
+//         if (o.dump)
+//         {
+//             trace("dump packed inputs ENTER");
+//             dump_packed_inputs(m, o.out / "packed_inputs");
+//             trace("dump packed inputs DONE");
+//         }
+//         std::vector<double> times;
+//         for (int i = 0; i < o.warmup + o.repeat; ++i)
+//         {
+//             if (i > 0)
+//                 pack_and_clean(m, values); // restore inputs potentially modified by in-place ops
+//             double elapsed = m.infer();
+//             if (i >= o.warmup)
+//                 times.push_back(elapsed);
+//             std::cout << "inference " << i + 1 << "/" << o.warmup + o.repeat << ": " << elapsed << " ms"
+//                       << (i < o.warmup ? " (warmup)" : "") << "\n";
+//         }
+//         auto read_start = Clock::now();
+//         for (auto &t : m.outputs)
+//             check(traced_call("output cache invalidate",
+//                               [&]
+//                               { return hbUCPMemFlush(&t.sysMem, HB_SYS_MEM_CACHE_INVALIDATE); }),
+//                   "output cache invalidate");
+//         trace("output unpack ENTER");
+//         auto logits = unpack_tensor(m.outputs[cls]), boxes = unpack_tensor(m.outputs[box]);
+//         if (FLAGS_save_outputs)
+//         {
+//             auto metadata = m.describe();
+//             for (size_t i = 0; i < m.outputs.size(); ++i)
+//             {
+//                 const auto &t = m.outputs[i];
+//                 auto name = "output_" + std::to_string(i) + ".bin";
+//                 std::ofstream raw((o.out / name).string(), std::ios::binary);
+//                 for (size_t n = 0; n < elements(t.properties); ++n)
+//                     raw.write(static_cast<const char *>(t.sysMem.virAddr) + byte_offset(t.properties, n), element_bytes(t.properties.tensorType));
+//                 require(bool(raw), "Cannot save compact raw output");
+//                 metadata["outputs"][i]["path"] = name;
+//                 metadata["outputs"][i]["storage"] = "compact C-order native dtype, no padding";
+//             }
+//             save_json(o.out / "raw_outputs.json", metadata);
+//         }
+//         trace("output unpack DONE");
+//         timing["output_invalidate_and_unpack_ms"] = ms(read_start);
+//         if (FLAGS_save_outputs)
+//         {
+//             dump_floats(o.out / "classification_f32.bin", logits);
+//             dump_floats(o.out / "prediction_f32.bin", boxes);
+//             save_json(o.out / "outputs.json", {{"inputs", json::array({{{"semantic", "classification"}, {"shape", shape_of(m.outputs[cls].properties)}, {"dtype", "float32"}, {"path", "classification_f32.bin"}},
+//                                                                        {{"semantic", "prediction"}, {"shape", shape_of(m.outputs[box].properties)}, {"dtype", "float32"}, {"path", "prediction_f32.bin"}}})}});
+//         }
+//         trace("decode ENTER");
+//         auto dec_start = Clock::now();
+//         auto detections = decode(logits, boxes, o.top_k, o.threshold);
+//         timing["decode_ms"] = ms(dec_start);
+//         trace("decode DONE");
+//         if (FLAGS_save_outputs)
+//             save_json(o.out / "detections.json", {{"frame_id", f.manifest.value("frame_id", std::string(""))},
+//                                                   {"classes", kClasses},
+//                                                   {"score_threshold", o.threshold},
+//                                                   {"top_k", o.top_k},
+//                                                   {"box_convention", "LiDAR center x,y,z; w,l,h in meters; yaw radians"},
+//                                                   {"detections", detection_json(detections)}});
+//         trace("visualization ENTER");
+//         auto vis_start = Clock::now();
+//         if (FLAGS_visualize)
+//         {
+//             auto displayed = detections;
+//             displayed.erase(std::remove_if(displayed.begin(), displayed.end(), [](const Detection &d)
+//                                            { return d.score < FLAGS_visualize_score_threshold; }),
+//                             displayed.end());
+//             visualize(f, displayed, o.out);
+//         }
+//         timing["visualize_and_save_images_ms"] = ms(vis_start);
+//         trace("visualization DONE");
+//         auto sorted = times;
+//         std::sort(sorted.begin(), sorted.end());
+//         timing["inference_ms_samples"] = times;
+//         timing["inference_mean_ms"] = std::accumulate(times.begin(), times.end(), 0.) / times.size();
+//         timing["inference_median_ms"] = (sorted[(sorted.size() - 1) / 2] + sorted[sorted.size() / 2]) / 2.;
+//         timing["inference_p95_ms"] = sorted[size_t(std::ceil(.95 * sorted.size())) - 1];
+//         timing["warmup"] = o.warmup;
+//         timing["repeat"] = o.repeat;
+//         timing["inference_scope"] = "hbDNNInferV2 + submit + wait; excludes pack, invalidate, decode, visualization";
+// #if defined(__x86_64__) || defined(_M_X64)
+//         timing["execution"] = "x86 simulation: NOT J6P board latency";
+// #else
+//         timing["execution"] = "native target; record board clocks/load separately";
+// #endif
+//         timing["end_to_end_before_timing_write_ms"] = ms(frame_start);
+//         save_json(o.out / "timing.json", timing);
+//         std::cout << "Saved " << detections.size() << " detections, camera overlays and BEV in " << fs::absolute(o.out).string() << "\n";
+//         return 0;
+//     }
+//     catch (const std::exception &e)
+//     {
+//         std::cerr << "sparse4d_J6P: " << e.what() << "\n";
+//         return 1;
+//     }
+// }
+
+// 完整替换run_frame.接受可选的已准备帧。流水线模式复用已经完成的前处理、绑定和首次打包；串行模式仍现场执行这些步骤。输出读取、检测解码、保存与可视化继续使用原实现。这里仍等待BPU任务完成后再读取结果。
+static int run_frame(const Options &o, Model &m,
+                     PreparedFrame *prepared = nullptr, json *report = nullptr)
+{
+    auto frame_start = prepared ? prepared->started : Clock::now();
     try
     {
         std::fesetround(FE_TONEAREST);
@@ -610,17 +1253,36 @@ static int run_frame(const Options &o, Model &m)
         trace("sparse4d_J6P diagnostic revision 2; warmup=" + std::to_string(o.warmup) + " repeat=" + std::to_string(o.repeat));
         fs::create_directories(o.out);
         json timing;
+        timing["pipeline"] = prepared != nullptr;
+        timing["frame_latency_scope"] = prepared
+                                            ? "producer starts frame -> per-frame result work finished; includes queue residence"
+                                            : "run_frame starts -> per-frame result work finished";
+        if (prepared)
+        {
+            timing["sequence_index"] = prepared->sequence;
+            timing["ready_to_consumer_ms"] = ms(prepared->ready);
+            timing["consumer_wait_for_frame_ms"] = prepared->consumer_wait_ms;
+        }
         Frame f;
         if (!o.inspect)
         {
             auto t = Clock::now();
-            f = preprocess(o.frame);
-            timing["load_images_and_preprocess_ms"] = ms(t);
+            if (prepared)
+                f = std::move(prepared->frame);
+            else
+                f = preprocess(o.frame);
+            timing["load_images_and_preprocess_ms"] =
+                prepared ? prepared->preprocess_ms : ms(t);
+            timing["preprocess_workers"] = FLAGS_preprocess_workers; // C++前处理四相机并行
+            timing["opencv_threads"] = cv::getNumThreads();          // C++前处理四相机并行
             if (o.dump || o.preprocess_only)
                 dump_inputs(f, o.out / "inputs");
             if (o.preprocess_only)
             {
+                timing["end_to_end_before_timing_write_ms"] = ms(frame_start);
                 save_json(o.out / "timing.json", timing);
+                if (report)
+                    *report = timing;
                 return 0;
             }
         }
@@ -646,7 +1308,9 @@ static int run_frame(const Options &o, Model &m)
         if (o.inspect)
             return 0;
         trace("bind inputs ENTER");
-        auto values = bind_inputs(m, f);
+        auto bind_start = Clock::now();
+        auto values = prepared ? std::move(prepared->values) : bind_inputs(m, f);
+        timing["bind_inputs_ms"] = prepared ? prepared->bind_ms : ms(bind_start);
         trace("bind inputs DONE");
         size_t cls = binding(m.output_names, f.manifest, "output_bindings", "classification", 0);
         size_t box = binding(m.output_names, f.manifest, "output_bindings", "prediction", 1);
@@ -661,8 +1325,9 @@ static int run_frame(const Options &o, Model &m)
         if (!m.inputs[0].sysMem.virAddr)
             m.allocate();
         auto pack_start = Clock::now();
-        pack_and_clean(m, values);
-        timing["input_pack_and_clean_ms"] = ms(pack_start);
+        if (!prepared)
+            pack_and_clean(m, values);
+        timing["input_pack_and_clean_ms"] = prepared ? prepared->pack_ms : ms(pack_start);
         if (o.dump)
         {
             trace("dump packed inputs ENTER");
@@ -753,6 +1418,8 @@ static int run_frame(const Options &o, Model &m)
 #endif
         timing["end_to_end_before_timing_write_ms"] = ms(frame_start);
         save_json(o.out / "timing.json", timing);
+        if (report)
+            *report = timing;
         std::cout << "Saved " << detections.size() << " detections, camera overlays and BEV in " << fs::absolute(o.out).string() << "\n";
         return 0;
     }
@@ -763,35 +1430,282 @@ static int run_frame(const Options &o, Model &m)
     }
 }
 
+// int Sparse4DMain(int argc, char **argv)
+// {
+//     gflags::ParseCommandLineFlags(&argc, &argv, true);
+//     try
+//     {
+//         // C++前处理四相机并行
+//         require(FLAGS_preprocess_workers >= 1 &&
+//                     FLAGS_preprocess_workers <= 4,
+//                 "preprocess_workers must be in [1, 4]");
+//         // Set once in the main thread, not inside camera workers.
+//         cv::setNumThreads(1);
+//         std::cout << "preprocess_workers=" << FLAGS_preprocess_workers
+//                   << " opencv_threads=" << cv::getNumThreads() << "\n"; // C++前处理四相机并行
+//         Model model;
+//         if (FLAGS_inspect_only)
+//             return run_frame(options("", FLAGS_dump_dir), model);
+//         require(!FLAGS_manifest.empty(), "--manifest is required");
+//         auto spec = read_json(FLAGS_manifest);
+//         if (!spec.is_array())
+//             return run_frame(options(FLAGS_manifest, FLAGS_dump_dir), model);
+//         require(FLAGS_num_frames == -1 || FLAGS_num_frames > 0, "Invalid num_frames");
+//         int count = 0;
+//         for (const auto &item : spec)
+//         {
+//             if (FLAGS_num_frames != -1 && count >= FLAGS_num_frames)
+//                 break;
+//             auto frame = fs::path(FLAGS_manifest).parent_path() / item.get<std::string>();
+//             int rc = run_frame(options(frame.string(), (fs::path(FLAGS_dump_dir) / std::to_string(count)).string()), model);
+//             if (rc)
+//                 return rc;
+//             ++count;
+//         }
+//         return 0;
+//     }
+//     catch (const std::exception &e)
+//     {
+//         std::cerr << e.what() << std::endl;
+//         return 1;
+//     }
+// }
+
+// 完整替换Sparse4DMain
+// 统一加载模型、按模式选择串行或双缓冲、检查每帧序号、回收独立输入槽，并在所有帧完成后写batch_timing.json。只有一个消费者调用模型推理，保持提交顺序。
 int Sparse4DMain(int argc, char **argv)
 {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try
     {
+        require(FLAGS_preprocess_workers >= 1 && FLAGS_preprocess_workers <= 4,
+                "preprocess_workers must be in [1, 4]");
+        require(!FLAGS_pipeline || (!FLAGS_inspect_only && !FLAGS_preprocess_only),
+                "pipeline is for inference; use pipeline=false for inspect/preprocess_only");
+        require(!FLAGS_pipeline || FLAGS_packed_input_dir.empty(),
+                "pipeline uses each frame's real inputs; packed_input_dir must be empty");
+        cv::setNumThreads(1);
+        trace_enabled = FLAGS_trace;
+        std::cout << "pipeline=" << FLAGS_pipeline
+                  << " preprocess_workers=" << FLAGS_preprocess_workers
+                  << " opencv_threads=" << cv::getNumThreads() << "\n";
+
+        // Start before manifest loading and HBM initialization.
+        const auto batch_start = Clock::now();
         Model model;
         if (FLAGS_inspect_only)
             return run_frame(options("", FLAGS_dump_dir), model);
         require(!FLAGS_manifest.empty(), "--manifest is required");
-        auto spec = read_json(FLAGS_manifest);
-        if (!spec.is_array())
-            return run_frame(options(FLAGS_manifest, FLAGS_dump_dir), model);
         require(FLAGS_num_frames == -1 || FLAGS_num_frames > 0, "Invalid num_frames");
-        int count = 0;
-        for (const auto &item : spec)
+        auto spec = read_json(FLAGS_manifest);
+        std::vector<Options> items;
+        if (spec.is_array())
         {
-            if (FLAGS_num_frames != -1 && count >= FLAGS_num_frames)
-                break;
-            auto frame = fs::path(FLAGS_manifest).parent_path() / item.get<std::string>();
-            int rc = run_frame(options(frame.string(), (fs::path(FLAGS_dump_dir) / std::to_string(count)).string()), model);
-            if (rc)
-                return rc;
-            ++count;
+            for (const auto &item : spec)
+            {
+                if (FLAGS_num_frames != -1 && int(items.size()) >= FLAGS_num_frames)
+                    break;
+                auto path = fs::path(FLAGS_manifest).parent_path() / item.get<std::string>();
+                items.push_back(options(path.string(),
+                                        (fs::path(FLAGS_dump_dir) / std::to_string(items.size())).string()));
+            }
+        }
+        else
+        {
+            items.push_back(options(FLAGS_manifest, FLAGS_dump_dir));
+        }
+        require(!items.empty(), "Manifest selected no frames");
+        fs::create_directories(FLAGS_dump_dir);
+
+        double model_load_ms = 0;
+        if (!FLAGS_preprocess_only)
+        {
+            const auto begin = Clock::now();
+            model.load(items.front());
+            model_load_ms = ms(begin);
+            if (FLAGS_pipeline)
+                model.allocate_outputs();
+            else
+                model.allocate();
+        }
+        const auto processing_start = Clock::now();
+        const double startup_ms =
+            std::chrono::duration<double, std::milli>(processing_start - batch_start).count();
+        size_t completed = 0;
+        int result = 0;
+        std::string error;
+        double inference_sum_ms = 0;
+        size_t inference_samples = 0;
+        json per_frame = json::array();
+
+        auto record = [&](size_t sequence, const json &timing)
+        {
+            if (timing.contains("inference_ms_samples"))
+            {
+                for (const auto &v : timing.at("inference_ms_samples"))
+                {
+                    inference_sum_ms += v.get<double>();
+                    ++inference_samples;
+                }
+            }
+            per_frame.push_back({{"sequence_index", sequence},
+                                 {"manifest", items[sequence].frame.string()},
+                                 {"timing_file", (items[sequence].out / "timing.json").string()},
+                                 {"preprocess_ms", timing.value("load_images_and_preprocess_ms", 0.)},
+                                 {"pack_ms", timing.value("input_pack_and_clean_ms", 0.)},
+                                 {"consumer_wait_for_frame_ms", timing.value("consumer_wait_for_frame_ms", 0.)}});
+            ++completed;
+        };
+
+        try
+        {
+            if (FLAGS_pipeline)
+            {
+                // Two slots total, including the one currently consumed by the BPU.
+                // The producer never reads/writes model's live tensor vectors.
+                OrderedSlots<PreparedFrame, 2> pipeline(
+                    items.size(),
+                    [&model]
+                    { return make_input_slot(model); },
+                    [&items](PreparedFrame &slot, size_t sequence)
+                    {
+                        std::fesetround(FE_TONEAREST);
+                        slot.sequence = sequence;
+                        slot.started = Clock::now();
+                        slot.frame = preprocess(items[sequence].frame);
+                        slot.preprocess_ms = ms(slot.started);
+                        auto begin = Clock::now();
+                        slot.values = bind_inputs(slot.buffers, slot.frame);
+                        slot.bind_ms = ms(begin);
+                        begin = Clock::now();
+                        pack_and_clean(slot.buffers, slot.values);
+                        slot.pack_ms = ms(begin);
+                        slot.ready = Clock::now();
+                    });
+                for (size_t sequence = 0; sequence < items.size(); ++sequence)
+                {
+                    size_t index = 0;
+                    auto wait_begin = Clock::now();
+                    require(pipeline.take(index), "Producer ended before all frames were ready");
+                    auto &slot = pipeline.at(index);
+                    slot.consumer_wait_ms = ms(wait_begin);
+                    require(slot.sequence == sequence, "Frame sequence mismatch");
+                    json timing;
+                    // Swap only tensor descriptors. The underlying memory is not copied.
+                    model.inputs.swap(slot.buffers.inputs);
+                    int rc;
+                    try
+                    {
+                        rc = run_frame(items[sequence], model, &slot, &timing);
+                    }
+                    catch (...)
+                    {
+                        model.inputs.swap(slot.buffers.inputs);
+                        throw;
+                    }
+                    model.inputs.swap(slot.buffers.inputs);
+                    pipeline.release(index);
+                    if (rc)
+                    {
+                        result = rc;
+                        error = "run_frame failed at sequence " + std::to_string(sequence);
+                        break;
+                    }
+                    record(sequence, timing);
+                }
+                // Joining also handles producer failure/consumer early exit safely.
+                pipeline.shutdown();
+            }
+            else
+            {
+                for (size_t sequence = 0; sequence < items.size(); ++sequence)
+                {
+                    json timing;
+                    int rc = run_frame(items[sequence], model, nullptr, &timing);
+                    if (rc)
+                    {
+                        result = rc;
+                        error = "run_frame failed at sequence " + std::to_string(sequence);
+                        break;
+                    }
+                    record(sequence, timing);
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            result = 1;
+            error = e.what();
+        }
+        // Includes per-frame dumps/visualization and pipeline shutdown.
+        // Excludes this batch summary's own write and final model destruction.
+        const auto end = Clock::now();
+        const double total_wall_ms =
+            std::chrono::duration<double, std::milli>(end - batch_start).count();
+        const double processing_wall_ms =
+            std::chrono::duration<double, std::milli>(end - processing_start).count();
+        const bool success = result == 0 && completed == items.size();
+        json summary = {
+            {"status", success ? "complete" : "failed"},
+            {"error", error},
+            {"requested_frames", items.size()},
+            {"completed_frames", completed},
+            {"pipeline", FLAGS_pipeline},
+            {"input_buffer_slots", FLAGS_pipeline ? 2 : 1},
+            {"preprocess_workers", FLAGS_preprocess_workers},
+            {"opencv_threads", cv::getNumThreads()},
+            {"core_id", FLAGS_core_id},
+            {"model_file", FLAGS_model_file},
+            {"manifest", FLAGS_manifest},
+            {"visualize", FLAGS_visualize},
+            {"save_outputs", FLAGS_save_outputs},
+            {"dump_inputs", FLAGS_dump_inputs},
+            {"trace", FLAGS_trace},
+            {"warmup_per_frame", FLAGS_warmup},
+            {"repeat_per_frame", FLAGS_repeat},
+            {"model_load_ms", model_load_ms},
+            {"startup_ms", startup_ms},
+            {"total_wall_ms", total_wall_ms},
+            {"processing_wall_ms", processing_wall_ms},
+            {"with_visualization_total_ms", FLAGS_visualize ? json(processing_wall_ms) : json(nullptr)},
+            {"without_visualization_total_ms", !FLAGS_visualize ? json(processing_wall_ms) : json(nullptr)},
+            {"with_visualization_mean_ms_per_frame", FLAGS_visualize && completed
+                                                         ? json(processing_wall_ms / completed)
+                                                         : json(nullptr)},
+            {"without_visualization_mean_ms_per_frame", !FLAGS_visualize && completed
+                                                            ? json(processing_wall_ms / completed)
+                                                            : json(nullptr)},
+            {"visualization_comparison_scope", "two independent runs; totals exclude startup; unmeasured mode is null, never derived by subtraction"},
+            {"actual_mean_ms_per_frame", completed ? json(total_wall_ms / completed) : json(nullptr)},
+            {"processing_mean_ms_per_frame", completed ? json(processing_wall_ms / completed) : json(nullptr)},
+            {"processing_fps", completed && processing_wall_ms > 0
+                                   ? json(1000. * completed / processing_wall_ms)
+                                   : json(nullptr)},
+            {"inference_ms_sum", inference_sum_ms},
+            {"inference_sample_count", inference_samples},
+            {"inference_mean_ms", inference_samples
+                                      ? json(inference_sum_ms / inference_samples)
+                                      : json(nullptr)},
+            {"total_scope", "before manifest/HBM load through last frame work and queue shutdown; excludes batch summary write/model destruction"},
+            {"processing_scope", "after HBM load/main buffer allocation; includes first-frame fill, slot allocation, drain and enabled IO/visualization"},
+            {"order", "manifest order; no sorting, dropping or skipping"},
+            {"frames", per_frame}};
+        save_json(fs::path(FLAGS_dump_dir) / "batch_timing.json", summary);
+        std::cout << "[Batch] completed=" << completed << "/" << items.size()
+                  << " total_wall_ms=" << total_wall_ms
+                  << " actual_mean_ms_per_frame=" << summary["actual_mean_ms_per_frame"]
+                  << " processing_mean_ms_per_frame=" << summary["processing_mean_ms_per_frame"]
+                  << " inference_mean_ms=" << summary["inference_mean_ms"] << "\n";
+        if (!success)
+        {
+            std::cerr << "sparse4d_J6P batch failed: " << error << "\n";
+            return result ? result : 1;
         }
         return 0;
     }
     catch (const std::exception &e)
     {
-        std::cerr << e.what() << std::endl;
+        std::cerr << "sparse4d_J6P: " << e.what() << "\n";
         return 1;
     }
 }

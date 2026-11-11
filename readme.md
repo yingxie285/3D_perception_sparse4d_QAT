@@ -347,6 +347,7 @@ bash bin/run_sparse4d.sh \
   --num_frames=-1 \
   --warmup=0 \
   --repeat=1 \
+  --pipeline=false \
   --preprocess_workers=4 \
   --save_outputs=true \
   --visualize=true \
@@ -355,6 +356,8 @@ bash bin/run_sparse4d.sh \
   --trace=true \
   2>&1 | tee run_100frames.log
 ```
+比较不同 HBM 本身的推理时延时，可以统一用 false。测量 CPU/BPU 同时工作的整批处理速度时，需要显式设置 --pipeline=true。
+不需要可视化图片时，用-visualize=false。
 这里遍历 manifest 中的全部帧，每帧推理一次，不预热。启动脚本设置 nash-m 和包内运行库路径。
 
 成功会生成：
@@ -508,9 +511,31 @@ ls ../deps_aarch64
 ```
 
 2. 修改 all-round-j6p/CMakeLists.txt
-打开all-round-j6p/CMakeLists.txt，其中用到了命名的地方已更改为sparse4d_J6P与J6P，如下所示：
+打开all-round-j6p/CMakeLists.txt，其中用到了J6M命名的地方更改为sparse4d_J6P与J6P，如下所示：
 ```text
 add_executable(sparse4d_J6P src/sparse4d/main.cc src/sparse4d/sparse4d_runtime.cc)
+# ============================================================
+# J6P AArch64 底层运行时动态库路径
+# ============================================================
+
+# ============================================================
+# J6P AArch64 runtime libraries
+# ============================================================
+
+if(SPARSE4D_ARCH STREQUAL "aarch64")
+
+    set(J6P_APPSDK_LIB_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../deps_aarch64/appsdk/appuser/lib"
+    )
+
+    target_link_options(sparse4d_J6P PRIVATE
+        "-Wl,-rpath-link,${J6P_APPSDK_LIB_DIR}"
+        "-Wl,--allow-shlib-undefined"
+    )
+
+endif()
+
+
 target_link_libraries(sparse4d_J6P dnn hbucp gflags opencv_world pthread dl rt)
 set_target_properties(sparse4d_J6P PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
 install(TARGETS sparse4d_J6P DESTINATION bin)
@@ -518,11 +543,13 @@ install(TARGETS sparse4d_J6P DESTINATION bin)
 SPARSE4D_ARCH=aarch64 保持原样。它描述的是 CPU 架构，并不是模型的 nash-m 或 nash-p。
 
 3. 修改 all-round-j6p/run_sparse4d.sh
-run_sparse4d.sh第5行和第6行已修改为J6P的命名，如下所示：
+run_sparse4d.sh第5行和第6行修改为nash-p和J6P的命名，如下所示：
+```text
 export HB_UCP_SIM_PLATFORM_TYPE=nash-p
 exec "$bin/sparse4d_J6P" "$@"
+```
 
-4. horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p/src/sparse4d/sparse4d_runtime.cc原本的sparse4d_J6M，用于诊断日志和报错前缀。已改成 sparse4d_J6P，便于区分两次板端测试。这两处文字不决定硬件目标。注释中的J6M也已改为J6P。
+4. horizon_j6_open_explorer_v3.8.1-py310_20260326/samples/ucp_tutorial/all-round-j6p/src/sparse4d/sparse4d_runtime.cc原本的所有sparse4d_J6M字样，用于诊断日志和报错前缀。改成 sparse4d_J6P，便于区分两次板端测试。这两处文字不决定硬件目标。注释中的J6M也改为J6P。
 
 5. 检查还有没有J6M字样
 在复制出的工程执行：
@@ -577,11 +604,13 @@ cp configs/sparse4d/model_io.json "$PACKAGE_ROOT/configs/"
 mkdir -p "$PACKAGE_ROOT/data/demo_100frames"
 cp -a "$UCP_ROOT/all-round/data/sparse4d/demo_100frames/." "$PACKAGE_ROOT/data/demo_100frames/"
 
-cd "$PACKAGE_ROOT"
-sha256sum model/model.hbm > model.sha256
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+sha256sum "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/qat_export/model.hbm" \
+          "$PACKAGE_ROOT/model/model.hbm"
 ls -lh bin/sparse4d_J6P model/model.hbm
 ```
-数据直接取自 J6M 工程导出的同一批 100 帧。configs/sparse4d/model_io.json 必须先与新的 J6P HBM 接口核对，不能直接认定 J6M 配置适用。
+两行 SHA256 应一致。
+数据直接取自 J6M 工程导出的同一批 100 帧。
 此命令会在aarch64文件夹下产生configs、data、model等文件
 ```text
 deploy/
@@ -598,6 +627,10 @@ deploy/
 
 9. 打包部署包
 ```bash
+cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
+
+export SDK_ROOT=/home/E2EModel/Model_Train_End/Sparse4D_QAT_dws/horizon_j6_open_explorer_v3.8.1-py310_20260326
+export UCP_ROOT="$SDK_ROOT/samples/ucp_tutorial"
 cd "$UCP_ROOT/all-round-j6p/deploy/sparse4d"
 tar -czvf "$UCP_ROOT/all-round-j6p/aarch64.tar.gz" aarch64/
 ```
@@ -624,6 +657,7 @@ bash bin/run_sparse4d.sh \
   --num_frames=-1 \
   --warmup=0 \
   --repeat=1 \
+  --pipeline=false \
   --preprocess_workers=4 \
   --save_outputs=true \
   --visualize=true \
@@ -632,6 +666,8 @@ bash bin/run_sparse4d.sh \
   --trace=true \
   2>&1 | tee run_j6p_100frames.log
 ```
+比较不同 HBM 本身的推理时延时，可以统一用 false。测量 CPU/BPU 同时工作的整批处理速度时，需要显式设置 --pipeline=true。
+不需要可视化图片时，用-visualize=false。
 这里遍历 manifest 中的全部帧，每帧推理一次，不预热。启动脚本设置了 nash-p 和包内运行库路径。
 
 成功时，并生成：
@@ -651,5 +687,4 @@ tar -czvf /app/J6P/aarch64/output_j6p_100frames.tar.gz \
   -C /app/J6P/aarch64 \
   output_j6p_100frames/
 ```
-
 运行tool/visualization/output_100frames_to_mp4.py脚本，可以将图片变成视频，方便查阅效果。运行前更改第12行input_dir和第13行output_mp4的路径。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a portable multi-frame J6M demo; standard library only.
+"""Export a portable multi-frame J6M/J6P demo; standard library only.
 
 Keep export_frame.py alongside this script. No model inference is performed.
 """
