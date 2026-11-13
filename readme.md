@@ -89,7 +89,13 @@ python tool/visualization/visulaize_new.py \
 各步骤按命令中的 cd 切换工作目录。除进入仓库的 cd 外，配置、权重、输出及日志均使用相对路径。
 ## 一、calib阶段
 运行下面的命令会进行run_calib_phase并得到导出的HBM模型。
-执行校准并编译生成 J6M 的 HBM 模型。使用 fusion8 量化配置，目标架构为 nash-m。其中，ckpt/iter_36800.pth为浮点的权重，CUDA_VISIBLE_DEVICES可以指定显卡。参考命令：
+执行校准并编译生成 J6M 的 HBM 模型。使用 fusion8 量化配置，目标架构为 nash-m。其中，ckpt/iter_36800.pth为浮点的权重，CUDA_VISIBLE_DEVICES可以指定显卡。
+由于calib阶段时间较长，建议使用 tmux来运行命令，先单独创建会话：
+```bash
+tmux new -s sparse4d_calib_fisheye_J6M
+```
+进入会话后执行命令,设置独立的 QAT_OUTPUT_PREFIX 和 --output-dir
+参考命令：
 ```bash
 cd /home/E2EModel/Model_Train_End/Sparse4D_QAT_dws
 
@@ -116,6 +122,7 @@ python3 script/qat_workflow_sparse4d.py \
   2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/calib_compile.log"
 ```
 CUDA_VISIBLE_DEVICES=7 指定物理 GPU 7，该 GPU 在进程内编号为 0，因此使用 --device 0。此处为单 GPU、--launcher none，无需使用 torch.distributed.run。
+（注：可以按ctrl+B,再按D，退出tmux会话界面，查看calib_compile.log日志即可知道脚本运行过程）
 
 主要产物如下：
 ```text
@@ -389,7 +396,7 @@ output_100frames/
 在script/qat_workflow_sparse4d.py脚本里是通过参数parser.add_argument("--march", )定义的，需通过命令显式传入nash-p。
 执行 run_calib_phase，从浮点权重重新校准并生成 J6P 的 HBM。使用独立输出目录，不覆盖已有 J6M 产物。
 
-如需使用 tmux，先单独创建会话：
+由于calib阶段时间较长，建议使用 tmux来运行命令，先单独创建会话：
 ```bash
 tmux new -s sparse4d_calib_fisheye_J6P
 ```
@@ -420,6 +427,8 @@ python3 script/qat_workflow_sparse4d.py \
   2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/calib_compile.log"
 ```
 这里使用单 GPU 和 --launcher none，无需 torch.distributed.run。物理 GPU 7 在进程内映射为设备 0，因此使用 --device 0。
+（注：可以按ctrl+B,再按D，退出tmux会话界面，查看calib_compile.log日志即可知道脚本运行过程）
+
 主要产物为：
 ```text
 Sparse4D_QAT/

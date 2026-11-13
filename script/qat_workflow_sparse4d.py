@@ -123,6 +123,31 @@ def get_qconfig_setter(model=None):
     if model is None:
         raise ValueError("get_qconfig_setter requires the deploy model")
 
+    #1111 全局 INT8 实验：直接返回，不再应用后面的 INT16 保护模板。
+    if os.environ.get("SPARSE4D_PERF_MODE", "base") == "global8_probe":
+        print("[PerfQConfig] global8_probe")
+        print("  Request INT8 outputs, Conv inputs/weights and Matmul inputs")
+
+        return QconfigSetter(
+            get_qconfig(
+                observer=observer_v2.HistogramObserver,
+                fix_scale=False,
+            ),
+            templates=[
+                ModuleNameTemplate({"": qint8}),
+                ConvDtypeTemplate(
+                    input_dtype=qint8,
+                    weight_dtype=qint8,
+                ),
+                MatmulDtypeTemplate(
+                    input_dtypes=(qint8, qint8),
+                ),
+            ],
+            save_dir=osp.join(
+                WORK_DIR, PREFIEX, "qconfig_setting"
+            ),
+        )
+    
     # Output settings for the camera-encoding branch.
     branch_outputs = {}
 

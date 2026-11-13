@@ -38,4 +38,5 @@ run_sparse4d_quant_mode() (
       2>&1 | tee "Sparse4D_QAT/$QAT_OUTPUT_PREFIX/eval_calib.log"
 )
 
-run_sparse4d_quant_mode fusion8 perf_r5_fusion8_reduce
+# run_sparse4d_quant_mode fusion8 perf_r5_fusion8_reduce
+run_sparse4d_quant_mode global8_probe perf_r6_global8
